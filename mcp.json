@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "odoo-json2": {
+      "command": "./server.mjs",
+      "env": {
+        "ODOO_URL": "${ODOO_URL}",
+        "ODOO_API_KEY": "${ODOO_API_KEY}",
+        "ODOO_DATABASE": "${ODOO_DATABASE}"
+      }
+    }
+  }
+}
