@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="odoo-json2">
+  <rect width="128" height="128" rx="28" fill="#714B67"/>
+  <text x="64" y="58" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="22" font-weight="700" fill="#FFFFFF">JSON-2</text>
+  <text x="64" y="86" text-anchor="middle" font-family="ui-sans-serif, system-ui, sans-serif" font-size="16" font-weight="600" fill="#E8D7E3">odoo</text>
+</svg>

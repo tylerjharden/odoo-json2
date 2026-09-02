@@ -3,10 +3,14 @@
   "version": "0.1.1",
   "description": "MCP tools for Odoo 19 External JSON-2 (POST /json/2/{model}/{method}).",
   "author": {
-    "name": "Tyler Harden"
+    "name": "Tyler Harden",
+    "email": "root@tylerjharden.dev"
   },
+  "homepage": "https://tylerjharden.dev",
+  "repository": "https://github.com/tylerjharden/odoo-json2",
   "license": "MIT",
   "keywords": ["odoo", "json-2", "erp", "mcp"],
+  "logo": "assets/logo.svg",
   "variables": {
     "type": "object",
     "properties": {
