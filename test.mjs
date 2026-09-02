@@ -402,4 +402,4 @@ await checkAsync("invalid model does not call fetch", async () => {
 });
 
 process.stderr.write(`\n${passed} passed, ${failed} failed\n`);
- if (failed) process.exit(1);
+if (failed) process.exit(1);
