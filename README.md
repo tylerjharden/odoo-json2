@@ -35,6 +35,37 @@ The `odoo-json2` skill documents `search`, `search_read`, `read`, `create`, `wri
 
 Do not put API keys in this repo. The plugin only declares variable names.
 
+## Cloud Agents (required for IPP / remote agents)
+
+A local Cursor plugin is **not** loaded by Cloud Agents. Repo `mcp.json` and `~/.cursor/plugins/local` do not apply on the VM. Official path: **dashboard Team MCP or the MCP dropdown on [cursor.com/agents](https://cursor.com/agents)**.
+
+Marketplace publish is an IDE distribution path. It does **not** enable Cloud Agents.
+
+**What you must click** (a Cloud Agent cannot register Team MCP):
+
+1. Open [cursor.com/dashboard/integrations](https://cursor.com/dashboard/integrations) → **Team MCP Servers** → add a custom **stdio** server named `odoo-json2`  
+   **or** open [cursor.com/agents](https://cursor.com/agents) → **MCP** dropdown → add the same server as personal MCP.
+2. Command / args / env:
+
+```json
+{
+  "command": "npx",
+  "args": ["-y", "github:tylerjharden/odoo-json2"],
+  "env": {
+    "ODOO_URL": "mycompany.odoo.com",
+    "ODOO_API_KEY": "<key from Preferences → Account Security → New API Key>",
+    "ODOO_DATABASE": "<database name>"
+  }
+}
+```
+
+3. Enable the server in the **MCP** dropdown for the run.
+4. Start a **new** Cloud Agent (MCP is applied at start). Confirm `odoo_call` and `odoo_version` appear in tools.
+
+If the team has an MCP allowlist: add a command pattern for `npx`. If egress is restricted: allow `github.com`, `codeload.github.com`, and `registry.npmjs.org`, plus the Odoo host.
+
+Do not add extra tools. `odoo_call` remains the JSON-2 surface. After changing those env values, toggle the MCP server off then on.
+
 ## Plugin variables
 
 Declared in `.cursor-plugin/plugin.json` and substituted into `mcp.json`:
