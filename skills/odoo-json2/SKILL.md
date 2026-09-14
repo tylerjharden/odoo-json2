@@ -21,10 +21,10 @@ Do not add per-model tools. Do not use XML-RPC (`/xmlrpc`) or JSON-RPC (`/jsonrp
 ## OdooCall
 
 ```
-OdooCall = { environment?, model, method, ids?, context?, params }
+OdooCall = { model, method, ids?, context?, params }
 ```
 
-When more than one Odoo instance is configured (`ODOO_DEV_URL` / `ODOO_TEST_URL` / `ODOO_PROD_URL`), **`environment` is required** (`dev`, `test`, or `prod`). Do not omit it and do not assume Prod. IPP ladder: Dev until verified, Test after merge to `dev`, Prod after merge to `main`. If the tool errors with “Choose an Odoo environment”, ask the user which instance and retry. A single-instance `ODOO_URL` setup may omit `environment`.
+The Odoo instance comes from the **connected plugin account** (Plugins → Configure → Add Another Account). Do not invent an `environment` tool argument. If no account is connected, ask the user to add Dev (then Test, then Prod) from that sheet. Prod is never implicit. IPP ladder: Dev until verified, Test after merge to `dev`, Prod after merge to `main`.
 
 The server `POST`s `{origin}/json/2/{model}/{method}` with:
 
@@ -74,4 +74,4 @@ Put these on `odoo_call` as `method`. Confirm kwargs on `/doc` for that database
 - External API access is on **Custom** Odoo pricing plans only — not One App Free or Standard.
 - UI-created keys last **at most three months** and must be rotated. The value is shown once at creation.
 
-If no environment is configured, or a named env is missing its URL / API key / database, stop and ask the user to set the Cursor plugin or Cloud MCP variables. Do not invent a host, key, or database name.
+If no account is connected, stop and ask the user to open Plugins → Configure → Add Another Account. Do not invent a host, key, or database name.

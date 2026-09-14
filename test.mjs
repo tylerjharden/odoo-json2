@@ -5,6 +5,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -21,9 +22,17 @@ import {
   resolveEnvironment,
   isProductionEnvironment,
   listTools,
-  elicitationParams,
   SERVER_VERSION,
+  pickEnvironment,
 } from "./server.mjs";
+import {
+  startHttp,
+  createMemoryStore,
+  authorizationServerMetadata,
+  protectedResourceMetadata,
+} from "./http.mjs";
+
+const realFetch = globalThis.fetch.bind(globalThis);
 
 const root = dirname(fileURLToPath(import.meta.url));
 const DECO_ADDICT = [{ id: 25, name: "Deco Addict" }];
@@ -279,7 +288,7 @@ await checkAsync("MCP stdio initialize, tools/list, ping", async () => {
     });
     assert.equal(init.result.protocolVersion, "2025-03-26");
     assert.deepEqual(init.result.capabilities, { tools: {} });
-    assert.equal(SERVER_VERSION, "0.2.0");
+    assert.equal(SERVER_VERSION, "0.3.0");
     assert.deepEqual(init.result.serverInfo, { name: "odoo-json2", version: SERVER_VERSION });
 
     client.send({ jsonrpc: "2.0", method: "notifications/initialized" });
@@ -398,7 +407,7 @@ await checkAsync("odoo_version GET /web/version without Authorization or databas
     });
     const text = toolText(rpc);
     assert.match(text, /"version": "19.0"/);
-    assert.match(text, /"environment": "default"/);
+    assert.match(text, /"account": "default"/);
     assert.match(text, /"origin": "https:\/\/mycompany.example.com"/);
     assert.equal(fetchCalls[0].url, "https://mycompany.example.com/web/version");
     assert.equal(fetchCalls[0].method, "GET");
@@ -530,39 +539,22 @@ check("loadEnvironments discovers Dev/Test/Prod and ignores legacy trio", () => 
 check("resolveEnvironment never silently picks Prod", () => {
   assert.equal(resolveEnvironment("dev", MULTI_ENV).url, "https://dev.example.com");
   assert.equal(resolveEnvironment("PROD", MULTI_ENV).name, "prod");
-  assert.throws(() => resolveEnvironment(undefined, MULTI_ENV), /Choose an Odoo environment/);
-  assert.throws(() => resolveEnvironment("", MULTI_ENV), /never the implicit default/);
-  assert.doesNotMatch(String(resolveEnvironment("dev", MULTI_ENV).name), /prod/);
+  assert.throws(() => resolveEnvironment(undefined, MULTI_ENV), /never the implicit default/);
+  assert.throws(() => resolveEnvironment("", MULTI_ENV), /Add Another Account/);
 });
 
-check("single named environment does not require a picker", () => {
-  const onlyDev = {
-    ODOO_DEV_URL: "https://dev.example.com",
-    ODOO_DEV_API_KEY: "dev-key",
-    ODOO_DEV_DATABASE: "dev-db",
-  };
-  assert.equal(resolveEnvironment(undefined, onlyDev).name, "dev");
-  const tools = listTools(onlyDev);
-  assert.equal(tools[0].inputSchema.required.includes("environment"), false);
-});
-
-check("tools/list requires environment enum when multiple instances exist", () => {
-  const tools = listTools(MULTI_ENV);
+check("tools/list has no environment enum — account is host-selected", () => {
+  const tools = listTools();
   assert.deepEqual(
     tools.map((t) => t.name),
     ["odoo_call", "odoo_version"]
   );
-  const call = tools[0];
-  assert.ok(call.inputSchema.required.includes("environment"));
-  assert.deepEqual(call.inputSchema.properties.environment.enum, ["dev", "test", "prod"]);
-  const version = tools[1];
-  assert.ok(version.inputSchema.required.includes("environment"));
-  const elicit = elicitationParams(loadEnvironments(MULTI_ENV));
-  assert.deepEqual(elicit.requestedSchema.properties.environment.enum, ["dev", "test", "prod"]);
-  assert.match(elicit.message, /never selected automatically/);
+  assert.equal(tools[0].inputSchema.properties.environment, undefined);
+  assert.equal(tools[0].inputSchema.required.includes("environment"), false);
+  assert.ok(tools[0].inputSchema.required.includes("model"));
 });
 
-await checkAsync("multi-instance odoo_call without environment does not fetch", async () => {
+await checkAsync("stdio multi-instance without a connected account does not fetch", async () => {
   fetchCalls.length = 0;
   const rpc = await handleJsonRpc(
     {
@@ -574,120 +566,180 @@ await checkAsync("multi-instance odoo_call without environment does not fetch", 
     { env: MULTI_ENV }
   );
   assert.equal(rpc.result.isError, true);
-  assert.match(toolText(rpc), /Choose an Odoo environment/);
-  assert.match(toolText(rpc), /prod \(Prod, production — never implicit\)/);
+  assert.match(toolText(rpc), /Add Another Account/);
   assert.equal(fetchCalls.length, 0);
 });
 
-await checkAsync("multi-instance odoo_call uses the chosen environment", async () => {
+await checkAsync("connected account instance is used instead of env default", async () => {
   fetchCalls.length = 0;
   const rpc = await handleJsonRpc(
     {
       jsonrpc: "2.0",
       id: 21,
       method: "tools/call",
-      params: {
-        name: "odoo_call",
-        arguments: { environment: "test", model: "res.partner", method: "search_read" },
-      },
+      params: { name: "odoo_call", arguments: { model: "res.partner", method: "search_read" } },
     },
-    { env: MULTI_ENV }
+    {
+      env: MULTI_ENV,
+      instance: {
+        name: "test",
+        url: "https://test.example.com",
+        apiKey: "test-key",
+        database: "test-db",
+        urlVar: "connected account",
+        keyVar: "connected account API key",
+        dbVar: "connected account database",
+      },
+    }
   );
   assert.equal(rpc.result.isError, undefined);
   assert.match(toolText(rpc), /Deco Addict/);
   assert.equal(fetchCalls[0].url, "https://test.example.com/json/2/res.partner/search_read");
   assert.equal(fetchCalls[0].headers.Authorization, "bearer test-key");
-  assert.equal(fetchCalls[0].headers["X-Odoo-Database"], "test-db");
 });
 
-await checkAsync("explicit Prod is allowed and still not implicit", async () => {
+await checkAsync("explicit Prod account is allowed and still not implicit", async () => {
   fetchCalls.length = 0;
   const rpc = await handleJsonRpc(
     {
       jsonrpc: "2.0",
       id: 22,
       method: "tools/call",
-      params: { name: "odoo_version", arguments: { environment: "prod" } },
-    },
-    { env: MULTI_ENV }
-  );
-  assert.match(toolText(rpc), /"environment": "prod"/);
-  assert.equal(fetchCalls[0].url, "https://prod.example.com/web/version");
-});
-
-await checkAsync("elicitation accept supplies the missing environment", async () => {
-  fetchCalls.length = 0;
-  let elicited = 0;
-  const rpc = await handleJsonRpc(
-    {
-      jsonrpc: "2.0",
-      id: 23,
-      method: "tools/call",
       params: { name: "odoo_version", arguments: {} },
     },
     {
-      env: MULTI_ENV,
-      elicit: async (instances) => {
-        elicited += 1;
-        assert.deepEqual(
-          instances.map((i) => i.name),
-          ["dev", "test", "prod"]
-        );
-        return "dev";
+      instance: {
+        name: "prod",
+        url: "https://prod.example.com",
+        apiKey: "prod-key",
+        database: "prod-db",
+        urlVar: "connected account",
+        keyVar: "connected account API key",
+        dbVar: "connected account database",
       },
     }
   );
-  assert.equal(elicited, 1);
-  assert.match(toolText(rpc), /"environment": "dev"/);
-  assert.equal(fetchCalls[0].url, "https://dev.example.com/web/version");
+  assert.match(toolText(rpc), /"account": "prod"/);
+  assert.equal(fetchCalls[0].url, "https://prod.example.com/web/version");
 });
 
-await checkAsync("MCP stdio elicitation/create prompts when environment is omitted", async () => {
-  const client = spawnServer(MULTI_ENV);
+function pkce() {
+  const verifier = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const challenge = createHash("sha256").update(verifier).digest("base64url");
+  return { verifier, challenge };
+}
+
+await checkAsync("HTTP OAuth connect Dev then call odoo_version on that account", async () => {
+  installMockFetch();
+  const store = createMemoryStore();
+  const http = await startHttp({ store, port: 0 });
+  const base = `http://127.0.0.1:${http.port}`;
   try {
-    await client.request(1, "initialize", {
-      protocolVersion: "2025-06-18",
-      capabilities: { elicitation: {} },
-      clientInfo: { name: "odoo-json2-test", version: "0.0.0" },
+    const prm = await (await realFetch(`${base}/.well-known/oauth-protected-resource`)).json();
+    assert.equal(prm.resource, `${base}/mcp`);
+    assert.deepEqual(authorizationServerMetadata(base).grant_types_supported, ["authorization_code", "refresh_token"]);
+    assert.equal(protectedResourceMetadata(base).authorization_servers[0], base);
+
+    const unauth = await realFetch(`${base}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
     });
-    client.send({
-      jsonrpc: "2.0",
-      id: 2,
-      method: "tools/call",
-      params: { name: "odoo_version", arguments: {} },
+    assert.equal(unauth.status, 401);
+    assert.match(unauth.headers.get("www-authenticate") || "", /resource_metadata=/);
+
+    const registered = await (
+      await realFetch(`${base}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          client_name: "cursor-test",
+          redirect_uris: ["http://localhost:8787/callback"],
+          token_endpoint_auth_method: "none",
+        }),
+      })
+    ).json();
+    const { verifier, challenge } = pkce();
+    const authorizeUrl = `${base}/oauth/authorize?response_type=code&client_id=${registered.client_id}&redirect_uri=${encodeURIComponent("http://localhost:8787/callback")}&code_challenge=${challenge}&code_challenge_method=S256&state=s1`;
+    const form = new URLSearchParams({
+      account: "dev",
+      url: "https://dev.example.com",
+      database: "dev-db",
+      api_key: "dev-key",
     });
-    const elicit = await client.recv();
-    assert.equal(elicit.method, "elicitation/create");
-    assert.match(elicit.params.message, /never selected automatically/);
-    assert.deepEqual(elicit.params.requestedSchema.properties.environment.enum, ["dev", "test", "prod"]);
-    client.send({
-      jsonrpc: "2.0",
-      id: elicit.id,
-      result: { action: "cancel" },
-    });
-    const result = await client.recv();
-    assert.equal(result.id, 2);
-    assert.equal(result.result.isError, true);
-    assert.match(result.result.content.map((c) => c.text).join("\n"), /Choose an Odoo environment/);
+    const posted = await realFetch(authorizeUrl, { method: "POST", body: form, redirect: "manual" });
+    assert.equal(posted.status, 302);
+    const location = new URL(posted.headers.get("location"));
+    assert.equal(location.searchParams.get("state"), "s1");
+    const code = location.searchParams.get("code");
+
+    const tokenBody = await (
+      await realFetch(`${base}/oauth/token`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          client_id: registered.client_id,
+          redirect_uri: "http://localhost:8787/callback",
+          code_verifier: verifier,
+        }),
+      })
+    ).json();
+    assert.ok(tokenBody.access_token);
+
+    fetchCalls.length = 0;
+    const mcp = await (
+      await realFetch(`${base}/mcp`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${tokenBody.access_token}`,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "odoo_version", arguments: {} } }),
+      })
+    ).json();
+    assert.match(mcp.result.content[0].text, /"account": "dev"/);
+    assert.equal(fetchCalls[0].url, "https://dev.example.com/web/version");
+
+    const listed = await (
+      await realFetch(`${base}/mcp`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${tokenBody.access_token}`,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 10, method: "tools/list" }),
+      })
+    ).json();
+    assert.deepEqual(
+      listed.result.tools.map((t) => t.name),
+      ["odoo_call", "odoo_version"]
+    );
+    assert.equal(listed.result.tools[0].inputSchema.properties.environment, undefined);
   } finally {
-    client.close();
+    await http.close();
   }
 });
 
-await checkAsync("MCP stdio lists required environment enum for Dev/Test/Prod", async () => {
-  const client = spawnServer(MULTI_ENV);
+await checkAsync("authorize form does not default the account to Prod", async () => {
+  const http = await startHttp({ store: createMemoryStore(), port: 0 });
+  const base = `http://127.0.0.1:${http.port}`;
   try {
-    await client.request(1, "initialize", {
-      protocolVersion: "2025-03-26",
-      capabilities: {},
-      clientInfo: { name: "odoo-json2-test", version: "0.0.0" },
-    });
-    const listed = await client.request(2, "tools/list", {});
-    const call = listed.result.tools.find((t) => t.name === "odoo_call");
-    assert.ok(call.inputSchema.required.includes("environment"));
-    assert.deepEqual(call.inputSchema.properties.environment.enum, ["dev", "test", "prod"]);
+    const page = await (await realFetch(`${base}/oauth/authorize?client_id=x`)).text();
+    assert.match(page, /Choose Dev, Test, or Prod/);
+    assert.match(page, /selected disabled/);
+    assert.doesNotMatch(page, /option value="prod" selected/);
+    await pickEnvironment({}, { env: {} }).then(
+      () => {
+        throw new Error("expected no account");
+      },
+      (err) => {
+        assert.match(err.message, /Add Another Account/);
+      }
+    );
   } finally {
-    client.close();
+    await http.close();
   }
 });
 

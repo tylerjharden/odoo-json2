@@ -1,6 +1,6 @@
 {
   "name": "odoo-json2",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Cursor plugin: MCP tools for Odoo 19 External JSON-2 (POST /json/2/{model}/{method}).",
@@ -19,6 +19,7 @@
   "scripts": {
     "check": "node --check server.mjs",
     "test": "node test.mjs",
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "start:http": "node http.mjs"
   }
 }

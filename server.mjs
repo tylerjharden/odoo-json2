@@ -12,7 +12,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SERVER_NAME = "odoo-json2";
-export const SERVER_VERSION = "0.2.0";
+export const SERVER_VERSION = "0.3.0";
 const USER_AGENT = "odoo-json2";
 const PROTOCOL_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18"];
 const DEFAULT_PROTOCOL = "2025-03-26";
@@ -178,8 +178,8 @@ export function formatEnvironmentChoices(instances) {
 
 export function environmentChoiceError(instances) {
   return (
-    "Choose an Odoo environment before calling. Pass environment on odoo_call / odoo_version " +
-    `(configured: ${formatEnvironmentChoices(instances)}). Prod is never the implicit default.`
+    "Multiple Odoo accounts are available. Connect or select one from the plugin Configure sheet " +
+    `(Add Another Account). Configured: ${formatEnvironmentChoices(instances)}. Prod is never the implicit default.`
   );
 }
 
@@ -187,8 +187,8 @@ export function resolveEnvironment(requested, env = process.env) {
   const instances = loadEnvironments(env);
   if (instances.length === 0) {
     throw new Error(
-      "No Odoo environment is configured. Set ODOO_DEV_URL, ODOO_DEV_API_KEY, and ODOO_DEV_DATABASE " +
-        "(plus Test/Prod equivalents), or the single-instance ODOO_URL / ODOO_API_KEY / ODOO_DATABASE."
+      "No Odoo account is connected. Use the plugin Configure sheet (Add Another Account), " +
+        "or set single-instance ODOO_URL / ODOO_API_KEY / ODOO_DATABASE for stdio."
     );
   }
 
@@ -197,7 +197,7 @@ export function resolveEnvironment(requested, env = process.env) {
     const name = normalizeEnvironmentName(raw);
     const hit = instances.find((instance) => instance.name === name);
     if (!hit) {
-      throw new Error(`Unknown environment "${raw}". Configured: ${formatEnvironmentChoices(instances)}.`);
+      throw new Error(`Unknown account "${raw}". Configured: ${formatEnvironmentChoices(instances)}.`);
     }
     return hit;
   }
@@ -209,18 +209,22 @@ export function resolveEnvironment(requested, env = process.env) {
   throw new Error(environmentChoiceError(instances));
 }
 
-async function pickEnvironment(args, options = {}) {
+/**
+ * Instance comes from a connected OAuth account (HTTP) or a single stdio env.
+ * Never pick Prod (or any instance) when more than one is configured.
+ */
+export async function pickEnvironment(args = {}, options = {}) {
+  if (options.instance) return options.instance;
   const env = options.env || process.env;
   const instances = loadEnvironments(env);
-  let requested = args && args.environment;
-  const missing = requested == null || String(requested).trim() === "";
-  if (missing && instances.length > 1 && typeof options.elicit === "function") {
-    const picked = await options.elicit(instances);
-    if (picked != null && String(picked).trim() !== "") {
-      requested = picked;
-    }
+  if (instances.length === 0) {
+    throw new Error(
+      "No Odoo account is connected. In Cursor: Plugins → Configure → Add Another Account " +
+        "(Dev, then Test, then Prod). Or set single-instance ODOO_URL / ODOO_API_KEY / ODOO_DATABASE for stdio."
+    );
   }
-  return resolveEnvironment(requested, env);
+  if (instances.length === 1) return instances[0];
+  throw new Error(environmentChoiceError(instances));
 }
 
 /**
@@ -353,41 +357,15 @@ function formatOdooHttpError(status, parsed, raw, includeDebug) {
   return snippet ? `HTTP ${status}: ${snippet}` : `HTTP ${status}`;
 }
 
-function environmentProperty(instances) {
-  const names = instances.map((instance) => instance.name);
-  const multi = instances.length > 1;
-  const description = multi
-    ? `Required. Which Odoo instance to call. Configured: ${formatEnvironmentChoices(instances)}. Prod is never selected unless you pass it explicitly.`
-    : instances.length === 1
-      ? `Odoo instance. Only ${instances[0].name} is configured, so this may be omitted.`
-      : "Odoo instance name (dev, test, prod). Required when more than one environment is configured.";
-  const schema = { type: "string", description };
-  if (names.length) schema.enum = names;
-  return { schema, required: multi };
-}
-
-export function listTools(env = process.env) {
-  const instances = loadEnvironments(env);
-  const { schema: environment, required: environmentRequired } = environmentProperty(instances);
-  const names = instances.map((instance) => instance.name);
-  const callRequired = ["model", "method"];
-  if (environmentRequired) callRequired.push("environment");
-  const versionRequired = environmentRequired ? ["environment"] : [];
-  const callDescription = environmentRequired
-    ? `Call one Odoo 19 External JSON-2 method: POST /json/2/{model}/{method}. Body is named kwargs only (ids, context, plus params). One SQL transaction per call. You must pass environment (${names.join("|")}). Prod is never the implicit default.`
-    : "Call one Odoo 19 External JSON-2 method: POST /json/2/{model}/{method}. Body is named kwargs only (ids, context, plus params). One SQL transaction per call.";
-  const versionDescription = environmentRequired
-    ? `GET {origin}/web/version — connectivity check. No API key. Returns { environment, origin, version, version_info }. You must pass environment (${names.join("|")}). Prod is never the implicit default.`
-    : "GET {ODOO_URL}/web/version — connectivity check. No API key. Returns { environment, origin, version, version_info }.";
-
+export function listTools() {
   return [
     {
       name: "odoo_call",
-      description: callDescription,
+      description:
+        "Call one Odoo 19 External JSON-2 method: POST /json/2/{model}/{method}. Body is named kwargs only (ids, context, plus params). One SQL transaction per call. Uses the Odoo account selected in the plugin Configure sheet.",
       inputSchema: {
         type: "object",
         properties: {
-          environment,
           model: {
             type: "string",
             description: "Technical model name, e.g. res.partner",
@@ -415,16 +393,16 @@ export function listTools(env = process.env) {
             description: "If true, include Odoo error.debug traceback on HTTP errors. Default false.",
           },
         },
-        required: callRequired,
+        required: ["model", "method"],
       },
     },
     {
       name: "odoo_version",
-      description: versionDescription,
+      description:
+        "GET {origin}/web/version — connectivity check. No API key. Returns { account, origin, version, version_info }. Uses the Odoo account selected in the plugin Configure sheet.",
       inputSchema: {
         type: "object",
-        properties: { environment },
-        ...(versionRequired.length ? { required: versionRequired } : {}),
+        properties: {},
       },
     },
   ];
@@ -495,7 +473,7 @@ export async function odooVersion(args = {}, options = {}) {
   if (response.status === 200 && parsed.ok && isPlainObject(parsed.value)) {
     return textResult(
       pretty({
-        environment: instance.name,
+        account: instance.name,
         origin,
         version: parsed.value.version,
         version_info: parsed.value.version_info,
@@ -547,7 +525,7 @@ export async function handleJsonRpc(message, options = {}) {
     }
 
     if (method === "tools/list") {
-      return jsonRpcResult(id, { tools: listTools(options.env || process.env) });
+      return jsonRpcResult(id, { tools: listTools() });
     }
 
     if (method === "tools/call") {
