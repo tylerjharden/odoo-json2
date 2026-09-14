@@ -275,12 +275,11 @@ function lookupAccount(store, accessToken) {
   return account || null;
 }
 
-export function startHttp(options = {}) {
+export function createHttpHandler(options = {}) {
   const store = options.store || createMemoryStore();
   const fallbackOrigin = (options.publicUrl || process.env.ODOO_JSON2_PUBLIC_URL || "").replace(/\/$/, "");
-  const port = options.port ?? DEFAULT_PORT;
 
-  const server = createServer(async (req, res) => {
+  return async (req, res) => {
     try {
       const origin = publicOrigin(req, fallbackOrigin);
       const url = new URL(req.url || "/", origin);
@@ -504,7 +503,12 @@ export function startHttp(options = {}) {
       log(err);
       json(res, 500, { error: "server_error" });
     }
-  });
+  };
+}
+
+export function startHttp(options = {}) {
+  const port = options.port ?? DEFAULT_PORT;
+  const server = createServer(createHttpHandler(options));
 
   return new Promise((resolveStart) => {
     server.listen(port, () => {
