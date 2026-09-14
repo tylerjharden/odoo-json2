@@ -178,8 +178,8 @@ export function formatEnvironmentChoices(instances) {
 
 export function environmentChoiceError(instances) {
   return (
-    "Multiple Odoo accounts are available. Connect or select one from the plugin Configure sheet " +
-    `(Add Another Account). Configured: ${formatEnvironmentChoices(instances)}. Prod is never the implicit default.`
+    "Multiple Odoo accounts are available. Connect one from the plugin Configure sheet " +
+    `(Environment Local → Connect). Configured: ${formatEnvironmentChoices(instances)}. Prod is never the implicit default.`
   );
 }
 
@@ -187,7 +187,7 @@ export function resolveEnvironment(requested, env = process.env) {
   const instances = loadEnvironments(env);
   if (instances.length === 0) {
     throw new Error(
-      "No Odoo account is connected. Use the plugin Configure sheet (Add Another Account), " +
+      "No Odoo account is connected. Use the plugin Configure sheet (Environment Local → Connect), " +
         "or set single-instance ODOO_URL / ODOO_API_KEY / ODOO_DATABASE for stdio."
     );
   }
@@ -219,8 +219,8 @@ export async function pickEnvironment(args = {}, options = {}) {
   const instances = loadEnvironments(env);
   if (instances.length === 0) {
     throw new Error(
-      "No Odoo account is connected. In Cursor: Plugins → Configure → Add Another Account " +
-        "(Dev, then Test, then Prod). Or set single-instance ODOO_URL / ODOO_API_KEY / ODOO_DATABASE for stdio."
+      "No Odoo account is connected. In Cursor: Plugins → Configure → Environment Local → Connect. " +
+        "Or set single-instance ODOO_URL / ODOO_API_KEY / ODOO_DATABASE for stdio."
     );
   }
   if (instances.length === 1) return instances[0];

@@ -540,7 +540,7 @@ check("resolveEnvironment never silently picks Prod", () => {
   assert.equal(resolveEnvironment("dev", MULTI_ENV).url, "https://dev.example.com");
   assert.equal(resolveEnvironment("PROD", MULTI_ENV).name, "prod");
   assert.throws(() => resolveEnvironment(undefined, MULTI_ENV), /never the implicit default/);
-  assert.throws(() => resolveEnvironment("", MULTI_ENV), /Add Another Account/);
+  assert.throws(() => resolveEnvironment("", MULTI_ENV), /Environment Local → Connect/);
 });
 
 check("tools/list has no environment enum — account is host-selected", () => {
@@ -566,7 +566,7 @@ await checkAsync("stdio multi-instance without a connected account does not fetc
     { env: MULTI_ENV }
   );
   assert.equal(rpc.result.isError, true);
-  assert.match(toolText(rpc), /Add Another Account/);
+  assert.match(toolText(rpc), /Environment Local → Connect/);
   assert.equal(fetchCalls.length, 0);
 });
 
@@ -735,7 +735,7 @@ await checkAsync("authorize form does not default the account to Prod", async ()
         throw new Error("expected no account");
       },
       (err) => {
-        assert.match(err.message, /Add Another Account/);
+        assert.match(err.message, /Environment Local → Connect/);
       }
     );
   } finally {

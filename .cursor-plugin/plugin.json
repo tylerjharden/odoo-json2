@@ -1,7 +1,7 @@
 {
   "name": "odoo-json2",
   "version": "0.3.0",
-  "description": "Odoo 19 External JSON-2 MCP. Connect Dev, Test, and Prod as plugin accounts (Notion-style Configure sheet).",
+  "description": "Odoo 19 External JSON-2 MCP. One OAuth connection per Cursor surface (Local / Cloud); tools odoo_call and odoo_version.",
   "author": {
     "name": "Tyler Harden",
     "email": "root@tylerjharden.dev"

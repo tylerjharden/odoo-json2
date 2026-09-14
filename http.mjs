@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Remote MCP (Streamable HTTP) + OAuth 2.1 so Cursor can show the same
- * plugin Configure sheet as Notion: Resource, plugin toggle, connected
- * accounts, Add Another Account, Logout.
+ * Remote MCP (Streamable HTTP) + OAuth 2.1 so Cursor can Connect / Logout
+ * on Configure (one slot per surface). Cursor does not draw Notion's named
+ * account list for third-party plugins.
  *
  * Each OAuth login is one Odoo instance (Dev / Test / Prod / custom).
  * Cursor stores the token; this process stores the API key. Tools stay
@@ -166,7 +166,7 @@ function unauthorized(res, origin) {
   json(
     res,
     401,
-    { error: "invalid_token", error_description: "Connect an Odoo account from the plugin Configure sheet." },
+    { error: "invalid_token", error_description: "Connect from the plugin Configure sheet (Environment Local → Connect)." },
     { "www-authenticate": `Bearer realm="odoo-json2", resource_metadata="${metadata}"` }
   );
 }
@@ -222,7 +222,7 @@ function authorizePage({ origin, query, error }) {
   .hint { color: #555; font-size: 13px; }
 </style></head><body>
 <h1>Connect an Odoo account</h1>
-<p>Each login is one instance. Add Dev, then Test, then Prod from <strong>Add Another Account</strong>. Prod is never selected automatically.</p>
+<p>This login fills the one Configure slot for this Cursor surface (Local or Cloud). Choose Dev unless you mean Test or Prod. Prod is never selected automatically. Cursor will show Connected / Logout, not a named account row.</p>
 ${err}
 <form method="post" action="/oauth/authorize?${escapeHtml(q)}">
   <label for="account">Account</label>

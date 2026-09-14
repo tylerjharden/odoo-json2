@@ -24,14 +24,14 @@ Do not add per-model tools. Do not use XML-RPC (`/xmlrpc`) or JSON-RPC (`/jsonrp
 OdooCall = { model, method, ids?, context?, params }
 ```
 
-The Odoo instance comes from the **connected plugin account** (Plugins → Configure → Add Another Account). Do not invent an `environment` tool argument. If no account is connected, ask the user to add Dev (then Test, then Prod) from that sheet. Prod is never implicit. IPP ladder: Dev until verified, Test after merge to `dev`, Prod after merge to `main`.
+The Odoo instance comes from the **one OAuth connection** on this Cursor surface (Configure → Environment Local → Connected). Do not invent an `environment` tool argument. Cursor does not list named Dev/Test/Prod rows or Add Another Account for this plugin. If nothing is connected, ask the user to Connect and complete the hosted form (Dev first). Prod is never implicit. IPP ladder: Dev until verified, Test after merge to `dev`, Prod after merge to `main`.
 
 The server `POST`s `{origin}/json/2/{model}/{method}` with:
 
 - `Authorization: bearer {ODOO_API_KEY}` (lowercase `bearer`, as in the Odoo docs)
 - `Content-Type: application/json; charset=utf-8`
 - `User-Agent: odoo-json2`
-- `X-Odoo-Database: {ODOO_DATABASE}` on every JSON-2 call (required plugin variable)
+- `X-Odoo-Database: {ODOO_DATABASE}` on every JSON-2 call (from the connected OAuth account or stdio env)
 
 Body is a single JSON object of **named** kwargs — no positional args:
 
@@ -74,4 +74,4 @@ Put these on `odoo_call` as `method`. Confirm kwargs on `/doc` for that database
 - External API access is on **Custom** Odoo pricing plans only — not One App Free or Standard.
 - UI-created keys last **at most three months** and must be rotated. The value is shown once at creation.
 
-If no account is connected, stop and ask the user to open Plugins → Configure → Add Another Account. Do not invent a host, key, or database name.
+If no account is connected, stop and ask the user to open Plugins → Configure → Environment Local → Connect. Do not invent a host, key, or database name.
