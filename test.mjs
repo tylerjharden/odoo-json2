@@ -5,11 +5,13 @@
  */
 
 import { spawn } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { mkdirSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 
-import { handleJsonRpc, parseOdooOrigin, assertPathSegment, buildOdooCall } from "./server.mjs";
+import { handleJsonRpc, parseOdooOrigin, assertPathSegment, buildOdooCall, isEntrypoint } from "./server.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const DECO_ADDICT = [{ id: 25, name: "Deco Addict" }];
@@ -118,8 +120,8 @@ class StdioClient {
   }
 }
 
-function spawnServer(env = {}) {
-  const child = spawn(process.execPath, [join(root, "server.mjs")], {
+function spawnServer(env = {}, entry = join(root, "server.mjs")) {
+  const child = spawn(process.execPath, [entry], {
     cwd: root,
     env: { ...process.env, ...env },
     stdio: ["pipe", "pipe", "pipe"],
@@ -188,10 +190,24 @@ check("parseOdooOrigin accepts https origin", () => {
 check("parseOdooOrigin prepends https when scheme is omitted", () => {
   assert.equal(parseOdooOrigin("mycompany.odoo.com"), "https://mycompany.odoo.com");
   assert.equal(parseOdooOrigin("mycompany.odoo.com/"), "https://mycompany.odoo.com");
+  assert.equal(parseOdooOrigin("  mycompany.odoo.com  "), "https://mycompany.odoo.com");
+  assert.equal(parseOdooOrigin("http://localhost:8069"), "http://localhost:8069");
 });
 
 check("parseOdooOrigin rejects a path", () => {
   assert.throws(() => parseOdooOrigin("https://mycompany.odoo.com/json/2"), /origin only/);
+  assert.throws(() => parseOdooOrigin("https://host/json/2"), /origin only/);
+});
+
+check("isEntrypoint follows npm bin symlinks", () => {
+  const self = fileURLToPath(new URL("./server.mjs", import.meta.url));
+  assert.equal(isEntrypoint(self, new URL("./server.mjs", import.meta.url).href), true);
+  const dir = join(tmpdir(), `odoo-json2-bin-${process.pid}`);
+  mkdirSync(dir, { recursive: true });
+  const link = join(dir, "odoo-json2");
+  symlinkSync(self, link);
+  assert.equal(isEntrypoint(link, new URL("./server.mjs", import.meta.url).href), true);
+  assert.equal(isEntrypoint(join(root, "test.mjs"), new URL("./server.mjs", import.meta.url).href), false);
 });
 
 check("assertPathSegment rejects slash and ..", () => {
@@ -202,8 +218,8 @@ check("assertPathSegment rejects slash and ..", () => {
   assert.throws(() => assertPathSegment("model", ""), /non-empty/);
 });
 
-check("buildOdooCall uses lowercase bearer and always sends db header", () => {
-  const withDb = buildOdooCall({
+check("buildOdooCall uses lowercase bearer and always sends X-Odoo-Database", () => {
+  const searchRead = buildOdooCall({
     origin: "https://mycompany.example.com",
     apiKey: "test-key",
     database: "mycompany",
@@ -212,18 +228,18 @@ check("buildOdooCall uses lowercase bearer and always sends db header", () => {
     context: { lang: "en_US" },
     params: { domain: [["name", "ilike", "%deco%"]], fields: ["name"] },
   });
-  assert.equal(withDb.url, "https://mycompany.example.com/json/2/res.partner/search_read");
-  assert.equal(withDb.headers.Authorization, "bearer test-key");
-  assert.equal(withDb.headers["Content-Type"], "application/json; charset=utf-8");
-  assert.equal(withDb.headers["User-Agent"], "odoo-json2");
-  assert.equal(withDb.headers["X-Odoo-Database"], "mycompany");
-  assert.deepEqual(withDb.body, {
+  assert.equal(searchRead.url, "https://mycompany.example.com/json/2/res.partner/search_read");
+  assert.equal(searchRead.headers.Authorization, "bearer test-key");
+  assert.equal(searchRead.headers["Content-Type"], "application/json; charset=utf-8");
+  assert.equal(searchRead.headers["User-Agent"], "odoo-json2");
+  assert.equal(searchRead.headers["X-Odoo-Database"], "mycompany");
+  assert.deepEqual(searchRead.body, {
     context: { lang: "en_US" },
     domain: [["name", "ilike", "%deco%"]],
     fields: ["name"],
   });
 
-  const readCall = buildOdooCall({
+  const read = buildOdooCall({
     origin: "https://mycompany.example.com",
     apiKey: "test-key",
     database: "mycompany",
@@ -232,8 +248,8 @@ check("buildOdooCall uses lowercase bearer and always sends db header", () => {
     ids: [25],
     params: { fields: ["name"] },
   });
-  assert.equal(readCall.headers["X-Odoo-Database"], "mycompany");
-  assert.deepEqual(readCall.body, { ids: [25], fields: ["name"] });
+  assert.equal(read.headers["X-Odoo-Database"], "mycompany");
+  assert.deepEqual(read.body, { ids: [25], fields: ["name"] });
 });
 
 // --- MCP stdio: initialize + tools/list (+ ping, Content-Length) ---
@@ -251,7 +267,7 @@ await checkAsync("MCP stdio initialize, tools/list, ping", async () => {
     });
     assert.equal(init.result.protocolVersion, "2025-03-26");
     assert.deepEqual(init.result.capabilities, { tools: {} });
-    assert.deepEqual(init.result.serverInfo, { name: "odoo-json2", version: "0.1.1" });
+    assert.deepEqual(init.result.serverInfo, { name: "odoo-json2", version: "0.1.2" });
 
     client.send({ jsonrpc: "2.0", method: "notifications/initialized" });
 
@@ -269,6 +285,36 @@ await checkAsync("MCP stdio initialize, tools/list, ping", async () => {
     const pong2 = await client.recv();
     assert.equal(pong2.id, 4);
     assert.deepEqual(pong2.result, {});
+  } finally {
+    client.close();
+  }
+});
+
+await checkAsync("MCP stdio via npm-style bin symlink (npx launch)", async () => {
+  const dir = join(tmpdir(), `odoo-json2-npx-${process.pid}`);
+  mkdirSync(join(dir, "node_modules", ".bin"), { recursive: true });
+  const link = join(dir, "node_modules", ".bin", "odoo-json2");
+  symlinkSync(join(root, "server.mjs"), link);
+  const client = spawnServer({}, link);
+  try {
+    const init = await client.request(1, "initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "odoo-json2-test", version: "0.0.0" },
+    });
+    assert.deepEqual(init.result.serverInfo, { name: "odoo-json2", version: "0.1.2" });
+    const listed = await client.request(2, "tools/list", {});
+    assert.deepEqual(listed.result.tools.map((t) => t.name).sort(), ["odoo_call", "odoo_version"]);
+  } finally {
+    client.close();
+  }
+});
+
+await checkAsync("MCP stdio via package bin wrapper", async () => {
+  const client = spawnServer({}, join(root, "bin", "odoo-json2.mjs"));
+  try {
+    const listed = await client.request(1, "tools/list", {});
+    assert.deepEqual(listed.result.tools.map((t) => t.name).sort(), ["odoo_call", "odoo_version"]);
   } finally {
     client.close();
   }
@@ -324,19 +370,29 @@ await checkAsync("odoo_call search_read returns docs Deco Addict payload", async
   });
 });
 
-await checkAsync("odoo_version GET /web/version without Authorization", async () => {
+await checkAsync("odoo_version GET /web/version without Authorization or database", async () => {
+  const prevDb = process.env.ODOO_DATABASE;
+  const prevKey = process.env.ODOO_API_KEY;
+  delete process.env.ODOO_DATABASE;
+  delete process.env.ODOO_API_KEY;
   fetchCalls.length = 0;
-  const rpc = await handleJsonRpc({
-    jsonrpc: "2.0",
-    id: 11,
-    method: "tools/call",
-    params: { name: "odoo_version", arguments: {} },
-  });
-  const text = toolText(rpc);
-  assert.match(text, /"version": "19.0"/);
-  assert.equal(fetchCalls[0].url, "https://mycompany.example.com/web/version");
-  assert.equal(fetchCalls[0].method, "GET");
-  assert.equal(fetchCalls[0].headers.Authorization, undefined);
+  try {
+    const rpc = await handleJsonRpc({
+      jsonrpc: "2.0",
+      id: 11,
+      method: "tools/call",
+      params: { name: "odoo_version", arguments: {} },
+    });
+    const text = toolText(rpc);
+    assert.match(text, /"version": "19.0"/);
+    assert.equal(fetchCalls[0].url, "https://mycompany.example.com/web/version");
+    assert.equal(fetchCalls[0].method, "GET");
+    assert.equal(fetchCalls[0].headers.Authorization, undefined);
+    assert.equal(fetchCalls[0].headers["X-Odoo-Database"], undefined);
+  } finally {
+    process.env.ODOO_DATABASE = prevDb;
+    process.env.ODOO_API_KEY = prevKey;
+  }
 });
 
 await checkAsync("HTTP error omits debug traceback by default", async () => {
@@ -371,7 +427,7 @@ await checkAsync("missing ODOO_API_KEY is a clear tool error", async () => {
   }
 });
 
-await checkAsync("missing ODOO_DATABASE is a clear tool error", async () => {
+await checkAsync("missing ODOO_DATABASE on odoo_call is a clear tool error", async () => {
   const prev = process.env.ODOO_DATABASE;
   delete process.env.ODOO_DATABASE;
   try {

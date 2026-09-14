@@ -7,11 +7,12 @@
  * Docs: https://www.odoo.com/documentation/19.0/developer/reference/external_api.html
  */
 
-import { fileURLToPath } from "node:url";
+import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const SERVER_NAME = "odoo-json2";
-const SERVER_VERSION = "0.1.1";
+const SERVER_VERSION = "0.1.2";
 const USER_AGENT = "odoo-json2";
 const PROTOCOL_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18"];
 const DEFAULT_PROTOCOL = "2025-03-26";
@@ -56,18 +57,17 @@ function envTrim(name) {
 
 /**
  * ODOO_URL must be an origin only (scheme + host[:port]), no path/query/hash.
+ * A host with no scheme:// is treated as https.
  */
 export function parseOdooOrigin(raw) {
-  if (!raw) {
+  const trimmed = raw == null ? "" : String(raw).trim();
+  if (!trimmed) {
     throw new Error("ODOO_URL is not set. Configure the Cursor plugin variable (origin only, e.g. https://mycompany.odoo.com).");
   }
-  let input = String(raw).trim();
-  if (input && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(input)) {
-    input = "https://" + input;
-  }
+  const withScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(trimmed) ? trimmed : `https://${trimmed}`;
   let url;
   try {
-    url = new URL(input);
+    url = new URL(withScheme);
   } catch {
     throw new Error("ODOO_URL is not a valid URL. Use an origin only, e.g. https://mycompany.odoo.com");
   }
@@ -111,7 +111,7 @@ export function requireDatabase() {
   const database = envTrim("ODOO_DATABASE");
   if (!database) {
     throw new Error(
-      "ODOO_DATABASE is not set. Set the Cursor plugin variable to the Odoo database name (sent as X-Odoo-Database on every JSON-2 call)."
+      "ODOO_DATABASE is not set. Set the Cursor plugin variable to the database name sent as X-Odoo-Database on every JSON-2 call."
     );
   }
   return database;
@@ -123,8 +123,8 @@ export function buildOdooCall({ origin, apiKey, database, model, method, ids, co
     Authorization: `bearer ${apiKey}`,
     "Content-Type": "application/json; charset=utf-8",
     "User-Agent": USER_AGENT,
+    "X-Odoo-Database": database,
   };
-  headers["X-Odoo-Database"] = database;
 
   const body = {
     ...(ids !== undefined ? { ids } : {}),
@@ -449,13 +449,23 @@ export function startStdio() {
   process.stdin.on("end", () => {
     process.exit(0);
   });
+  process.stdin.resume();
 }
 
-function isMain() {
-  if (!process.argv[1]) return false;
-  return fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+/**
+ * True when this file is the process entry. npm/npx bins are often a symlink
+ * (…/node_modules/.bin/odoo-json2 → …/server.mjs); compare realpaths so
+ * Cloud Agent `npx` actually starts stdio instead of exiting 0 with no output.
+ */
+export function isEntrypoint(argv1 = process.argv[1], selfUrl = import.meta.url) {
+  if (!argv1) return false;
+  try {
+    return realpathSync(fileURLToPath(selfUrl)) === realpathSync(argv1);
+  } catch {
+    return fileURLToPath(selfUrl) === resolve(argv1);
+  }
 }
 
-if (isMain()) {
+if (isEntrypoint()) {
   startStdio();
 }

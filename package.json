@@ -1,6 +1,6 @@
 {
   "name": "odoo-json2",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "type": "module",
   "description": "Cursor plugin: MCP tools for Odoo 19 External JSON-2 (POST /json/2/{model}/{method}).",
@@ -11,7 +11,7 @@
     "url": "https://github.com/tylerjharden/odoo-json2.git"
   },
   "bin": {
-    "odoo-json2": "./server.mjs"
+    "odoo-json2": "./bin/odoo-json2.mjs"
   },
   "engines": {
     "node": ">=18"

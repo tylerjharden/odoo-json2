@@ -6,7 +6,6 @@ Cursor plugin that exposes [Odoo 19 External JSON-2](https://www.odoo.com/docume
 OdooCall = { model, method, ids?, context?, params }
 POST {ODOO_URL}/json/2/{model}/{method}
 Authorization: bearer {ODOO_API_KEY}
-X-Odoo-Database: {ODOO_DATABASE}
 ```
 
 ## Tools
@@ -23,7 +22,7 @@ The `odoo-json2` skill documents `search`, `search_read`, `read`, `create`, `wri
 - Cursor IDE (desktop). **Grok Bot cannot load `~/.cursor/plugins/local`.** Grok Bot plugins are account-wide marketplace connectors, not this local folder.
 - Node.js 18 or newer (global `fetch`, no npm dependencies).
 - An Odoo 19 database on a **Custom** pricing plan (the external API is not available on One App Free or Standard).
-- A user API key and the database name.
+- A user API key.
 
 ## Install in Cursor IDE
 
@@ -31,7 +30,8 @@ The `odoo-json2` skill documents `search`, `search_read`, `read`, `create`, `wri
 2. Reload the window (**Developer: Reload Window**).
 3. Open **Plugins → Configure** and set the variables below.
 4. Confirm the `odoo-json2` MCP server and the `odoo-json2` skill appear under Customize.
-5. After changing plugin variables, toggle the `odoo-json2` MCP server off and on. Reload Window alone does not pick up new env values.
+
+After you change plugin variables, **toggle the odoo-json2 MCP server off then on**. Reload Window alone is not enough — Cursor caches the MCP process environment.
 
 Do not put API keys in this repo. The plugin only declares variable names.
 
@@ -41,16 +41,16 @@ A local Cursor plugin is **not** loaded by Cloud Agents. Repo `mcp.json` and `~/
 
 Marketplace publish is an IDE distribution path. It does **not** enable Cloud Agents.
 
-**What you must click** (a Cloud Agent cannot register Team MCP):
+**What Tyler must click** (this agent cannot register Team MCP):
 
 1. Open [cursor.com/dashboard/integrations](https://cursor.com/dashboard/integrations) → **Team MCP Servers** → add a custom **stdio** server named `odoo-json2`  
    **or** open [cursor.com/agents](https://cursor.com/agents) → **MCP** dropdown → add the same server as personal MCP.
-2. Command / args / env:
+2. Command / args / env (0.1.2+; `--prefer-online` avoids a stale npx cache of the 0.1.1 empty-exit bug):
 
 ```json
 {
   "command": "npx",
-  "args": ["-y", "github:tylerjharden/odoo-json2"],
+  "args": ["-y", "--prefer-online", "github:tylerjharden/odoo-json2"],
   "env": {
     "ODOO_URL": "mycompany.odoo.com",
     "ODOO_API_KEY": "<key from Preferences → Account Security → New API Key>",
@@ -60,7 +60,7 @@ Marketplace publish is an IDE distribution path. It does **not** enable Cloud Ag
 ```
 
 3. Enable the server in the **MCP** dropdown for the run.
-4. Start a **new** Cloud Agent (MCP is applied at start). Confirm `odoo_call` and `odoo_version` appear in tools.
+4. Toggle `odoo-json2-dev` (or `odoo-json2`) **off then on** so Cloud Agents pull 0.1.2, then start a **new** Cloud Agent. Confirm `odoo_call` and `odoo_version` appear. If discovery still shows only `mcp_auth`, the spawn never stayed up.
 
 If the team has an MCP allowlist: add a command pattern for `npx`. If egress is restricted: allow `github.com`, `codeload.github.com`, and `registry.npmjs.org`, plus the Odoo host.
 
@@ -72,11 +72,11 @@ Declared in `.cursor-plugin/plugin.json` and substituted into `mcp.json`:
 
 | Variable         | Required | Meaning |
 | ---------------- | -------- | ------- |
-| `ODOO_URL`       | yes      | Host or origin. `https://` is added if omitted. No path. |
+| `ODOO_URL`       | yes      | Origin only, e.g. `https://mycompany.odoo.com` or `mycompany.odoo.com` — no path. `https://` is added if you omit the scheme. |
 | `ODOO_API_KEY`   | yes      | User API key (see below). |
-| `ODOO_DATABASE`  | yes      | Database name. Sent as `X-Odoo-Database` on every JSON-2 call. |
+| `ODOO_DATABASE`  | yes      | Database name sent as `X-Odoo-Database` on every JSON-2 call (required). |
 
-`mcp.json` launches `./server.mjs` as a plugin-relative executable. Cursor's local plugin loader does not expand `${PLUGIN_ROOT}` in args.
+Cursor launches the MCP server as the plugin-relative executable `./server.mjs` (shebang `#!/usr/bin/env node`). Do not put `${PLUGIN_ROOT}` in `args` — the local plugin loader does not expand it.
 
 ## Mint an API key
 
@@ -137,7 +137,7 @@ Prefer `search_read` over `search` then `read`. Each JSON-2 request is its own S
 ## Run locally (dev)
 
 ```bash
-export ODOO_URL=https://mycompany.odoo.com
+export ODOO_URL=mycompany.odoo.com   # or https://mycompany.odoo.com
 export ODOO_API_KEY=your-key
 export ODOO_DATABASE=mycompany
 node server.mjs
