@@ -28,6 +28,10 @@ import {
 import {
   startHttp,
   createMemoryStore,
+  createBlobJsonStore,
+  createRuntimeStore,
+  createFileStore,
+  parseBlobStoreId,
   authorizationServerMetadata,
   protectedResourceMetadata,
   parseMcpPath,
@@ -290,7 +294,7 @@ await checkAsync("MCP stdio initialize, tools/list, ping", async () => {
     });
     assert.equal(init.result.protocolVersion, "2025-03-26");
     assert.deepEqual(init.result.capabilities, { tools: {} });
-    assert.equal(SERVER_VERSION, "0.3.1");
+    assert.equal(SERVER_VERSION, "0.3.2");
     assert.deepEqual(init.result.serverInfo, { name: "odoo-json2", version: SERVER_VERSION });
 
     client.send({ jsonrpc: "2.0", method: "notifications/initialized" });
@@ -804,6 +808,113 @@ await checkAsync("authorize form does not default the account to Prod", async ()
   } finally {
     await http.close();
   }
+});
+
+function mockBlobFetch() {
+  const files = new Map();
+  const storeId = "teststoreid";
+  const token = `vercel_blob_rw_${storeId}_secret`;
+  const fetchImpl = async (url, init = {}) => {
+    const method = (init.method || "GET").toUpperCase();
+    const u = new URL(url, "https://example.test");
+    if (method === "PUT") {
+      const pathname = u.searchParams.get("pathname");
+      files.set(pathname, String(init.body || ""));
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ url: `https://${storeId}.private.blob.vercel-storage.com/${pathname}` }),
+        text: async () => "{}",
+      };
+    }
+    const pathname = u.pathname.replace(/^\//, "");
+    if (!files.has(pathname)) {
+      return { ok: false, status: 404, text: async () => "not found" };
+    }
+    const body = files.get(pathname);
+    return { ok: true, status: 200, text: async () => body };
+  };
+  return { token, storeId, fetchImpl, files };
+}
+
+await checkAsync("durable Blob store survives a second isolate with the same bearer", async () => {
+  const blob = mockBlobFetch();
+  assert.equal(parseBlobStoreId(blob.token), blob.storeId);
+  const isolateA = createBlobJsonStore({ token: blob.token, fetchImpl: blob.fetchImpl, storeId: blob.storeId });
+  const httpA = await startHttp({ store: isolateA, port: 0 });
+  const base = `http://127.0.0.1:${httpA.port}`;
+  let accessToken;
+  try {
+    const registered = await (
+      await realFetch(`${base}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ redirect_uris: ["http://localhost:8787/callback"] }),
+      })
+    ).json();
+    const { verifier, challenge } = pkce();
+    const authorizeUrl = `${base}/oauth/authorize?response_type=code&client_id=${registered.client_id}&redirect_uri=${encodeURIComponent("http://localhost:8787/callback")}&code_challenge=${challenge}&code_challenge_method=S256&resource=${encodeURIComponent(`${base}/mcp/dev`)}`;
+    const posted = await realFetch(authorizeUrl, {
+      method: "POST",
+      body: new URLSearchParams({ url: "https://dev.example.com", database: "dev-db", api_key: "dev-key" }),
+      redirect: "manual",
+    });
+    const code = new URL(posted.headers.get("location")).searchParams.get("code");
+    const tokenBody = await (
+      await realFetch(`${base}/oauth/token`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          client_id: registered.client_id,
+          redirect_uri: "http://localhost:8787/callback",
+          code_verifier: verifier,
+        }),
+      })
+    ).json();
+    accessToken = tokenBody.access_token;
+    assert.ok(accessToken);
+    const first = await realFetch(`${base}/mcp/dev`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    assert.equal(first.status, 200);
+  } finally {
+    await httpA.close();
+  }
+
+  const isolateB = createBlobJsonStore({ token: blob.token, fetchImpl: blob.fetchImpl, storeId: blob.storeId });
+  const httpB = await startHttp({ store: isolateB, port: 0 });
+  const baseB = `http://127.0.0.1:${httpB.port}`;
+  try {
+    const later = await realFetch(`${baseB}/mcp/dev`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    assert.equal(later.status, 200);
+    assert.equal((await later.json()).account, "dev");
+    const prod = await realFetch(`${baseB}/mcp/prod`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    assert.equal(prod.status, 401);
+  } finally {
+    await httpB.close();
+  }
+});
+
+check("createRuntimeStore prefers Blob over a local file path", () => {
+  const blob = mockBlobFetch();
+  const store = createRuntimeStore({
+    BLOB_READ_WRITE_TOKEN: blob.token,
+    ODOO_JSON2_STORE: "/tmp/should-not-use.json",
+  });
+  assert.equal(typeof store.read().then, "function");
+  const file = createRuntimeStore({ ODOO_JSON2_STORE: "/tmp/odoo-json2-runtime-file.json" });
+  assert.equal(typeof createFileStore, "function");
+  file.write({ clients: { x: 1 }, codes: {}, tokens: {}, accounts: {} });
+  assert.equal(file.read().clients.x, 1);
 });
 
 process.stderr.write(`\n${passed} passed, ${failed} failed\n`);

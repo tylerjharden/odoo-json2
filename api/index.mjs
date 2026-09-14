@@ -1,8 +1,9 @@
 /**
- * Vercel Node adapter for the long-running http.mjs server.
- * Body parsing stays off so OAuth + MCP can read the raw stream.
+ * Vercel Node adapter. Tokens, DCR clients, and instance credentials live in
+ * Vercel Blob (BLOB_READ_WRITE_TOKEN) so they survive isolate recycling.
+ * /tmp and in-memory stores do not.
  */
-import { createFileStore, createHttpHandler } from "../http.mjs";
+import { createHttpHandler, createRuntimeStore } from "../http.mjs";
 
 export const config = {
   api: {
@@ -10,7 +11,7 @@ export const config = {
   },
 };
 
-const store = createFileStore(process.env.ODOO_JSON2_STORE || "/tmp/odoo-json2-store.json");
+const store = createRuntimeStore();
 const handler = createHttpHandler({ store });
 
 export default handler;

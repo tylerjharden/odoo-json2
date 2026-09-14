@@ -4,12 +4,10 @@
  * (single-instance local / Cloud Agent fallback).
  */
 import { startStdio } from "../server.mjs";
-import { startHttp, createFileStore } from "../http.mjs";
-import { resolve } from "node:path";
+import { startHttp, createRuntimeStore } from "../http.mjs";
 
 if (process.argv.includes("--http")) {
-  const storePath = process.env.ODOO_JSON2_STORE || resolve("data/store.json");
-  await startHttp({ store: createFileStore(storePath) });
+  await startHttp({ store: createRuntimeStore() });
 } else {
   startStdio();
 }

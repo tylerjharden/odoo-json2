@@ -58,8 +58,22 @@ function safeEqual(a, b) {
   return timingSafeEqual(left, right);
 }
 
-function emptyStore() {
+const BLOB_API = process.env.VERCEL_BLOB_API_URL || "https://vercel.com/api/blob";
+const BLOB_API_VERSION = "12";
+const DEFAULT_BLOB_PATH = "odoo-json2-oauth-store.json";
+const DEFAULT_KV_KEY = "odoo-json2-oauth-store";
+
+export function emptyStore() {
   return { clients: {}, codes: {}, tokens: {}, accounts: {} };
+}
+
+function normalizeStore(parsed) {
+  return {
+    clients: (parsed && parsed.clients) || {},
+    codes: (parsed && parsed.codes) || {},
+    tokens: (parsed && parsed.tokens) || {},
+    accounts: (parsed && parsed.accounts) || {},
+  };
 }
 
 export function createMemoryStore(initial = emptyStore()) {
@@ -80,13 +94,7 @@ export function createFileStore(filePath) {
   return {
     read() {
       try {
-        const parsed = JSON.parse(readFileSync(path, "utf8"));
-        return {
-          clients: parsed.clients || {},
-          codes: parsed.codes || {},
-          tokens: parsed.tokens || {},
-          accounts: parsed.accounts || {},
-        };
+        return normalizeStore(JSON.parse(readFileSync(path, "utf8")));
       } catch {
         return emptyStore();
       }
@@ -97,15 +105,145 @@ export function createFileStore(filePath) {
   };
 }
 
-function mutate(store, fn) {
-  const next = structuredClone(store.read());
+export function createSharedJsonStore(backend) {
+  if (!backend.data) backend.data = emptyStore();
+  return {
+    read() {
+      return structuredClone(backend.data);
+    },
+    write(next) {
+      backend.data = structuredClone(next);
+    },
+  };
+}
+
+export function parseBlobStoreId(token) {
+  const parts = String(token || "").split("_");
+  return parts[3] || "";
+}
+
+export function createBlobJsonStore(options = {}) {
+  const token = options.token || process.env.BLOB_READ_WRITE_TOKEN || "";
+  const pathname = options.pathname || process.env.ODOO_JSON2_BLOB_PATH || DEFAULT_BLOB_PATH;
+  const fetchImpl = options.fetchImpl || fetch;
+  const access = options.access || "private";
+  const apiUrl = (options.apiUrl || BLOB_API).replace(/\/$/, "");
+  const storeId = options.storeId || parseBlobStoreId(token);
+
+  return {
+    async read() {
+      if (!storeId) throw new Error("Vercel Blob store id missing from BLOB_READ_WRITE_TOKEN");
+      const url = new URL(`https://${storeId}.${access}.blob.vercel-storage.com/${pathname}`);
+      url.searchParams.set("cache", "0");
+      const res = await fetchImpl(url.toString(), {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      if (res.status === 404) return emptyStore();
+      if (!res.ok) {
+        throw new Error(`blob get ${res.status}: ${await res.text()}`);
+      }
+      try {
+        return normalizeStore(JSON.parse(await res.text()));
+      } catch {
+        return emptyStore();
+      }
+    },
+    async write(next) {
+      const params = new URLSearchParams({ pathname });
+      const res = await fetchImpl(`${apiUrl}/?${params}`, {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "x-api-version": BLOB_API_VERSION,
+          "x-content-type": "application/json",
+          "x-add-random-suffix": "0",
+          "x-allow-overwrite": "1",
+          "x-vercel-blob-access": access,
+          "x-cache-control-max-age": "60",
+        },
+        body: JSON.stringify(next),
+      });
+      if (!res.ok) {
+        throw new Error(`blob put ${res.status}: ${await res.text()}`);
+      }
+    },
+  };
+}
+
+export function createKvJsonStore(options = {}) {
+  const base = (options.url || process.env.KV_REST_API_URL || "").replace(/\/$/, "");
+  const token = options.token || process.env.KV_REST_API_TOKEN || "";
+  const key = options.key || process.env.ODOO_JSON2_KV_KEY || DEFAULT_KV_KEY;
+  const fetchImpl = options.fetchImpl || fetch;
+
+  async function command(argv) {
+    const res = await fetchImpl(base, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(argv),
+    });
+    if (!res.ok) {
+      throw new Error(`kv ${argv[0]} ${res.status}: ${await res.text()}`);
+    }
+    return res.json();
+  }
+
+  return {
+    async read() {
+      const body = await command(["GET", key]);
+      if (body.result == null) return emptyStore();
+      try {
+        const parsed = typeof body.result === "string" ? JSON.parse(body.result) : body.result;
+        return normalizeStore(parsed);
+      } catch {
+        return emptyStore();
+      }
+    },
+    async write(next) {
+      await command(["SET", key, JSON.stringify(next)]);
+    },
+  };
+}
+
+export function createRuntimeStore(env = process.env) {
+  if (env.BLOB_READ_WRITE_TOKEN) {
+    return createBlobJsonStore({
+      token: env.BLOB_READ_WRITE_TOKEN,
+      pathname: env.ODOO_JSON2_BLOB_PATH || DEFAULT_BLOB_PATH,
+    });
+  }
+  if (env.KV_REST_API_URL && env.KV_REST_API_TOKEN) {
+    return createKvJsonStore({
+      url: env.KV_REST_API_URL,
+      token: env.KV_REST_API_TOKEN,
+      key: env.ODOO_JSON2_KV_KEY || DEFAULT_KV_KEY,
+    });
+  }
+  return createFileStore(env.ODOO_JSON2_STORE || resolve("data/store.json"));
+}
+
+async function readStore(store) {
+  const value = store.read();
+  return value && typeof value.then === "function" ? await value : value;
+}
+
+async function writeStore(store, next) {
+  const value = store.write(next);
+  if (value && typeof value.then === "function") await value;
+}
+
+async function mutate(store, fn) {
+  const next = structuredClone(await readStore(store));
   const result = fn(next);
-  store.write(next);
+  await writeStore(store, next);
   return result;
 }
 
-function prune(store, now = Date.now()) {
-  mutate(store, (data) => {
+async function prune(store, now = Date.now()) {
+  await mutate(store, (data) => {
     for (const [id, row] of Object.entries(data.codes)) {
       if (row.exp < now) delete data.codes[id];
     }
@@ -292,12 +430,12 @@ function bearer(req) {
   return match ? match[1].trim() : "";
 }
 
-function lookupAccount(store, accessToken) {
+async function lookupAccount(store, accessToken) {
   if (!accessToken) return null;
-  const row = store.read().tokens[accessToken];
+  const data = await readStore(store);
+  const row = data.tokens[accessToken];
   if (!row || row.kind !== "access" || row.exp < Date.now()) return null;
-  const account = store.read().accounts[row.accountId];
-  return account || null;
+  return data.accounts[row.accountId] || null;
 }
 
 export function createHttpHandler(options = {}) {
@@ -345,7 +483,7 @@ export function createHttpHandler(options = {}) {
           return;
         }
         const clientId = token();
-        mutate(store, (data) => {
+        await mutate(store, (data) => {
           data.clients[clientId] = {
             client_id: clientId,
             redirect_uris: redirectUris,
@@ -379,7 +517,7 @@ export function createHttpHandler(options = {}) {
         const state = params.state || "";
         const challenge = params.code_challenge || "";
         const method = params.code_challenge_method || "S256";
-        const client = store.read().clients[clientId];
+        const client = (await readStore(store)).clients[clientId];
         const locked = lockedAccountFromAuthorizeQuery(params);
         if (!client || !isAllowedRedirect(redirectUri, client.redirect_uris)) {
           text(res, 400, authorizePage({ origin, query: params, locked, error: "Unknown OAuth client or redirect URI." }), "text/html; charset=utf-8");
@@ -413,7 +551,7 @@ export function createHttpHandler(options = {}) {
         }
         const accountId = token();
         const code = token();
-        mutate(store, (data) => {
+        await mutate(store, (data) => {
           data.accounts[accountId] = {
             id: accountId,
             name: accountName,
@@ -443,21 +581,19 @@ export function createHttpHandler(options = {}) {
       }
 
       if (url.pathname === "/oauth/token" && req.method === "POST") {
-        prune(store);
+        await prune(store);
         const raw = await readBody(req);
         const form = raw.includes("=") ? parseForm(raw) : raw ? JSON.parse(raw) : {};
         if (form.grant_type === "authorization_code") {
-          const row = store.read().codes[form.code];
+          const row = (await readStore(store)).codes[form.code];
           if (!row || row.exp < Date.now() || row.clientId !== form.client_id || row.redirectUri !== form.redirect_uri || !verifyPkce(form.code_verifier, row.challenge)) {
             json(res, 400, { error: "invalid_grant" });
             return;
           }
-          mutate(store, (data) => {
-            delete data.codes[form.code];
-          });
           const access = token();
           const refresh = token();
-          mutate(store, (data) => {
+          await mutate(store, (data) => {
+            delete data.codes[form.code];
             data.tokens[access] = { kind: "access", accountId: row.accountId, exp: Date.now() + ACCESS_TTL_MS };
             data.tokens[refresh] = { kind: "refresh", accountId: row.accountId, exp: Date.now() + REFRESH_TTL_MS };
           });
@@ -471,13 +607,13 @@ export function createHttpHandler(options = {}) {
           return;
         }
         if (form.grant_type === "refresh_token") {
-          const row = store.read().tokens[form.refresh_token];
+          const row = (await readStore(store)).tokens[form.refresh_token];
           if (!row || row.kind !== "refresh" || row.exp < Date.now()) {
             json(res, 400, { error: "invalid_grant" });
             return;
           }
           const access = token();
-          mutate(store, (data) => {
+          await mutate(store, (data) => {
             data.tokens[access] = { kind: "access", accountId: row.accountId, exp: Date.now() + ACCESS_TTL_MS };
           });
           json(res, 200, {
@@ -496,7 +632,7 @@ export function createHttpHandler(options = {}) {
       const mcpPath = parseMcpPath(url.pathname);
       if (mcpPath) {
         if (req.method === "GET") {
-          const account = lookupAccount(store, bearer(req));
+          const account = await lookupAccount(store, bearer(req));
           if (!account || (mcpPath.locked && account.name !== mcpPath.locked)) {
             unauthorized(res, origin, mcpPath.suffix);
             return;
@@ -508,7 +644,7 @@ export function createHttpHandler(options = {}) {
           json(res, 405, { error: "method_not_allowed" });
           return;
         }
-        const account = lookupAccount(store, bearer(req));
+        const account = await lookupAccount(store, bearer(req));
         if (!account || (mcpPath.locked && account.name !== mcpPath.locked)) {
           unauthorized(res, origin, mcpPath.suffix);
           return;
@@ -561,8 +697,7 @@ export function startHttp(options = {}) {
 
 const self = fileURLToPath(import.meta.url);
 if (process.argv[1] && resolve(process.argv[1]) === self) {
-  const storePath = process.env.ODOO_JSON2_STORE || resolve("data/store.json");
-  startHttp({ store: createFileStore(storePath) }).then(({ port }) => {
+  startHttp({ store: createRuntimeStore() }).then(({ port }) => {
     log(`odoo-json2 ${SERVER_VERSION} HTTP MCP on :${port} (OAuth accounts)`);
   });
 }
