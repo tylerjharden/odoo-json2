@@ -24,12 +24,14 @@ Do not add per-model tools. Do not use XML-RPC (`/xmlrpc`) or JSON-RPC (`/jsonrp
 OdooCall = { model, method, ids?, context?, params }
 ```
 
-The server `POST`s `{ODOO_URL}/json/2/{model}/{method}` with:
+The Odoo instance comes from the connected HTTP MCP (`odoo-json2-dev` / `-test` / `-prod` on `/mcp/dev` etc.) for this Cursor surface (Local, Cloud, or Cloud — ipp). Do not invent an `environment` tool argument. If nothing is connected, ask the user to Connect on the matching server. Prod is never implicit. IPP ladder: Dev until verified, Test after merge to `dev`, Prod after merge to `main`.
+
+The server `POST`s `{origin}/json/2/{model}/{method}` with:
 
 - `Authorization: bearer {ODOO_API_KEY}` (lowercase `bearer`, as in the Odoo docs)
 - `Content-Type: application/json; charset=utf-8`
 - `User-Agent: odoo-json2`
-- `X-Odoo-Database: {ODOO_DATABASE}` on every JSON-2 call (required plugin variable)
+- `X-Odoo-Database: {ODOO_DATABASE}` on every JSON-2 call (from the connected OAuth account or stdio env)
 
 Body is a single JSON object of **named** kwargs — no positional args:
 
@@ -72,4 +74,4 @@ Put these on `odoo_call` as `method`. Confirm kwargs on `/doc` for that database
 - External API access is on **Custom** Odoo pricing plans only — not One App Free or Standard.
 - UI-created keys last **at most three months** and must be rotated. The value is shown once at creation.
 
-If `ODOO_URL`, `ODOO_API_KEY`, or `ODOO_DATABASE` is missing, stop and ask the user to set the Cursor plugin variables. Do not invent a host, key, or database name.
+If no account is connected, stop and ask the user to open Plugins → Configure → Environment Local → Connect. Do not invent a host, key, or database name.

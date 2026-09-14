@@ -1,12 +1,14 @@
 {
-  "mcpServers": {
-    "odoo-json2": {
-      "command": "./server.mjs",
-      "env": {
-        "ODOO_URL": "${ODOO_URL}",
-        "ODOO_API_KEY": "${ODOO_API_KEY}",
-        "ODOO_DATABASE": "${ODOO_DATABASE}"
-      }
-    }
+  "odoo-json2-dev": {
+    "type": "http",
+    "url": "https://odoo-json2.tylerjharden.dev/mcp/dev"
+  },
+  "odoo-json2-test": {
+    "type": "http",
+    "url": "https://odoo-json2.tylerjharden.dev/mcp/test"
+  },
+  "odoo-json2-prod": {
+    "type": "http",
+    "url": "https://odoo-json2.tylerjharden.dev/mcp/prod"
   }
 }

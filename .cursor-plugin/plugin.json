@@ -1,7 +1,7 @@
 {
   "name": "odoo-json2",
-  "version": "0.1.2",
-  "description": "MCP tools for Odoo 19 External JSON-2 (POST /json/2/{model}/{method}).",
+  "version": "0.3.2",
+  "description": "Odoo 19 External JSON-2 MCP. Named Dev / Test / Prod HTTP URLs plus one OAuth slot per Cursor surface.",
   "author": {
     "name": "Tyler Harden",
     "email": "root@tylerjharden.dev"
@@ -15,30 +15,5 @@
     "erp",
     "mcp"
   ],
-  "logo": "assets/logo.svg",
-  "variables": {
-    "type": "object",
-    "properties": {
-      "ODOO_URL": {
-        "type": "string",
-        "title": "Odoo URL",
-        "description": "Host or origin, e.g. mycompany.odoo.com or https://mycompany.odoo.com. https:// is added if omitted. No path."
-      },
-      "ODOO_API_KEY": {
-        "type": "string",
-        "title": "Odoo API key",
-        "description": "User API key from Preferences \u2192 Account Security \u2192 New API Key."
-      },
-      "ODOO_DATABASE": {
-        "type": "string",
-        "title": "Odoo database",
-        "description": "Database name. Sent as X-Odoo-Database on every JSON-2 call (required)."
-      }
-    },
-    "required": [
-      "ODOO_URL",
-      "ODOO_API_KEY",
-      "ODOO_DATABASE"
-    ]
-  }
+  "logo": "assets/logo.svg"
 }

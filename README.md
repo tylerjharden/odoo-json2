@@ -4,16 +4,16 @@ Cursor plugin that exposes [Odoo 19 External JSON-2](https://www.odoo.com/docume
 
 ```
 OdooCall = { model, method, ids?, context?, params }
-POST {ODOO_URL}/json/2/{model}/{method}
-Authorization: bearer {ODOO_API_KEY}
+POST {origin}/json/2/{model}/{method}
+Authorization: bearer {api_key}
 ```
 
 ## Tools
 
 | Tool           | What it does |
 | -------------- | ------------ |
-| `odoo_call`    | One JSON-2 call. Named kwargs only. |
-| `odoo_version` | `GET /web/version` — connectivity, no API key. |
+| `odoo_call`    | One JSON-2 call. Named kwargs only. Uses the account selected in Plugins → Configure. |
+| `odoo_version` | `GET /web/version` — connectivity, no API key. Same connected account. |
 
 The `odoo-json2` skill documents `search`, `search_read`, `read`, `create`, `write`, `unlink`, and `search_count`, plus the one-transaction-per-call rule.
 
@@ -24,65 +24,67 @@ The `odoo-json2` skill documents `search`, `search_read`, `read`, `create`, `wri
 - An Odoo 19 database on a **Custom** pricing plan (the external API is not available on One App Free or Standard).
 - A user API key.
 
-## Install in Cursor IDE
+## Install (match the Notion Configure sheet)
 
-1. Copy this directory to `~/.cursor/plugins/local/odoo-json2`.
-2. Reload the window (**Developer: Reload Window**).
-3. Open **Plugins → Configure** and set the variables below.
-4. Confirm the `odoo-json2` MCP server and the `odoo-json2` skill appear under Customize.
+[makenotion/cursor-notion-plugin](https://github.com/makenotion/cursor-notion-plugin) `mcp.json` is **unwrapped** (no `mcpServers` key):
 
-After you change plugin variables, **toggle the odoo-json2 MCP server off then on**. Reload Window alone is not enough — Cursor caches the MCP process environment.
+```json
+{ "notion": { "type": "http", "url": "https://mcp.notion.com/mcp" } }
+```
 
-Do not put API keys in this repo. The plugin only declares variable names.
+`plugin.json` is only `name` / metadata (no `variables`). Cursor’s plugins reference does **not** document a Notion-only flag or an accounts API. Notion’s Environment rows on that sheet are **Cursor surfaces** (`Local`, `Cloud`, `Cloud — ipp`), each with Connect / Logout.
 
-## Cloud Agents (required for IPP / remote agents)
-
-A local Cursor plugin is **not** loaded by Cloud Agents. Repo `mcp.json` and `~/.cursor/plugins/local` do not apply on the VM. Official path: **dashboard Team MCP or the MCP dropdown on [cursor.com/agents](https://cursor.com/agents)**.
-
-Marketplace publish is an IDE distribution path. It does **not** enable Cloud Agents.
-
-**What Tyler must click** (this agent cannot register Team MCP):
-
-1. Open [cursor.com/dashboard/integrations](https://cursor.com/dashboard/integrations) → **Team MCP Servers** → add a custom **stdio** server named `odoo-json2`  
-   **or** open [cursor.com/agents](https://cursor.com/agents) → **MCP** dropdown → add the same server as personal MCP.
-2. Command / args / env (0.1.2+; `--prefer-online` avoids a stale npx cache of the 0.1.1 empty-exit bug):
+0.3.2 copies that `mcp.json` shape and ships **three** HTTP resources so Dev / Test / Prod are separate connections (smallest workaround if **+ Add Another Account** still does not appear after Cloud rows are connected). The Vercel pin stores OAuth clients, tokens, and instance credentials in private Blob so Connect survives isolate recycling:
 
 ```json
 {
-  "command": "npx",
-  "args": ["-y", "--prefer-online", "github:tylerjharden/odoo-json2"],
-  "env": {
-    "ODOO_URL": "mycompany.odoo.com",
-    "ODOO_API_KEY": "<key from Preferences → Account Security → New API Key>",
-    "ODOO_DATABASE": "<database name>"
-  }
+  "odoo-json2-dev": { "type": "http", "url": "https://odoo-json2.tylerjharden.dev/mcp/dev" },
+  "odoo-json2-test": { "type": "http", "url": "https://odoo-json2.tylerjharden.dev/mcp/test" },
+  "odoo-json2-prod": { "type": "http", "url": "https://odoo-json2.tylerjharden.dev/mcp/prod" }
 }
 ```
 
-3. Enable the server in the **MCP** dropdown for the run.
-4. Toggle `odoo-json2-dev` (or `odoo-json2`) **off then on** so Cloud Agents pull 0.1.2, then start a **new** Cloud Agent. Confirm `odoo_call` and `odoo_version` appear. If discovery still shows only `mcp_auth`, the spawn never stayed up.
+`/mcp` still works (existing pin). `/mcp/dev` rejects a Test/Prod token.
 
-If the team has an MCP allowlist: add a command pattern for `npx`. If egress is restricted: allow `github.com`, `codeload.github.com`, and `registry.npmjs.org`, plus the Odoo host.
+**Stdio + dashboard env** is a different path. Use the HTTP pin for Desktop.
 
-Do not add extra tools. `odoo_call` remains the JSON-2 surface. After changing those env values, toggle the MCP server off then on.
+### 1. Host the MCP (required)
 
-## Plugin variables
+```bash
+export ODOO_JSON2_PUBLIC_URL=https://odoo-json2.tylerjharden.dev
+export ODOO_JSON2_STORE=/var/lib/odoo-json2/store.json
+node http.mjs   # or: docker build && run, PORT=8788
+```
 
-Declared in `.cursor-plugin/plugin.json` and substituted into `mcp.json`:
+On Vercel (`odoo-json2` → `https://odoo-json2.tylerjharden.dev`) the store is private Blob (`BLOB_READ_WRITE_TOKEN`), not `/tmp`. Do not put Odoo API keys in git or Vercel env — they stay in the authorize form and the Blob JSON. Plugin `mcp.json` uses `/mcp/dev`, `/mcp/test`, `/mcp/prod`.
 
-| Variable         | Required | Meaning |
-| ---------------- | -------- | ------- |
-| `ODOO_URL`       | yes      | Origin only, e.g. `https://mycompany.odoo.com` or `mycompany.odoo.com` — no path. `https://` is added if you omit the scheme. |
-| `ODOO_API_KEY`   | yes      | User API key (see below). |
-| `ODOO_DATABASE`  | yes      | Database name sent as `X-Odoo-Database` on every JSON-2 call (required). |
+### 2. Install the plugin (0.3.2)
 
-Cursor launches the MCP server as the plugin-relative executable `./server.mjs` (shebang `#!/usr/bin/env node`). Do not put `${PLUGIN_ROOT}` in `args` — the local plugin loader does not expand it.
+Copy or clone **into** `~/.cursor/plugins/local/odoo-json2` from this branch (no outbound symlink), or republish / refresh the marketplace listing. Reload Window.
+
+### 3. Get Local + Cloud + Cloud — ipp rows (Notion Environment list)
+
+Those names are Cursor resources, not Odoo envs. They appear only after each surface is connected:
+
+1. **Local** — already on Desktop after Connect on `odoo-json2-dev`.
+2. **Cloud** — Dashboard → Integrations & MCP → custom HTTP `https://odoo-json2.tylerjharden.dev/mcp/dev` (no env) **or** add the plugin to the team marketplace. Configure → Resource **Cloud** → toggle on → Connect (Dev form).
+3. **Cloud — ipp** — same URL on the IPP Cloud resource. Configure → Resource **Cloud — ipp** → toggle on → Connect.
+
+If **+ Add Another Account** appears after those rows (same host chrome as Notion), use it. Cursor docs do not list a plugin.json key that forces that button. If it is still missing, connect **odoo-json2-test** and **odoo-json2-prod** the same way (separate MCP URLs). Do not put Prod keys in Vercel env.
+
+IPP ladder: Dev until verified → Test after merge to `dev` → Prod after merge to `main`.
+
+Do not add extra JSON-2 tools. `odoo_call` remains the API surface.
+
+## Stdio fallback (no account list)
+
+`npx` / `node server.mjs` still speaks MCP stdio with `ODOO_URL` / `ODOO_API_KEY` / `ODOO_DATABASE` for a **single** instance. Use it only for local debugging.
 
 ## Mint an API key
 
 In Odoo: **Preferences → Account Security → New API Key**.
 
-Give the key a description and a duration (maximum three months). The value is shown once — copy it into the Cursor plugin variable. For integrations, Odoo recommends a dedicated bot user with the minimum access rights rather than a personal admin account.
+Give the key a description and a duration (maximum three months). The value is shown once — paste it on the hosted Connect form (or into stdio `ODOO_API_KEY` for local debugging). For integrations, Odoo recommends a dedicated bot user with the minimum access rights rather than a personal admin account.
 
 The server sends `Authorization: bearer …` with a lowercase `bearer`, matching the Odoo 19 docs.
 
@@ -137,7 +139,12 @@ Prefer `search_read` over `search` then `read`. Each JSON-2 request is its own S
 ## Run locally (dev)
 
 ```bash
-export ODOO_URL=mycompany.odoo.com   # or https://mycompany.odoo.com
+# Hosted HTTP + OAuth (Configure → Connect)
+export ODOO_JSON2_PUBLIC_URL=http://127.0.0.1:8788
+node http.mjs
+
+# Stdio single instance (no account list)
+export ODOO_URL=mycompany.odoo.com
 export ODOO_API_KEY=your-key
 export ODOO_DATABASE=mycompany
 node server.mjs

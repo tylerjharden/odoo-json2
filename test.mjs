@@ -5,13 +5,40 @@
  */
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdirSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 
-import { handleJsonRpc, parseOdooOrigin, assertPathSegment, buildOdooCall, isEntrypoint } from "./server.mjs";
+import {
+  handleJsonRpc,
+  parseOdooOrigin,
+  assertPathSegment,
+  buildOdooCall,
+  isEntrypoint,
+  loadEnvironments,
+  resolveEnvironment,
+  isProductionEnvironment,
+  listTools,
+  SERVER_VERSION,
+  pickEnvironment,
+} from "./server.mjs";
+import {
+  startHttp,
+  createMemoryStore,
+  createBlobJsonStore,
+  createRuntimeStore,
+  createFileStore,
+  parseBlobStoreId,
+  authorizationServerMetadata,
+  protectedResourceMetadata,
+  parseMcpPath,
+  lockedAccountFromAuthorizeQuery,
+} from "./http.mjs";
+
+const realFetch = globalThis.fetch.bind(globalThis);
 
 const root = dirname(fileURLToPath(import.meta.url));
 const DECO_ADDICT = [{ id: 25, name: "Deco Addict" }];
@@ -267,7 +294,8 @@ await checkAsync("MCP stdio initialize, tools/list, ping", async () => {
     });
     assert.equal(init.result.protocolVersion, "2025-03-26");
     assert.deepEqual(init.result.capabilities, { tools: {} });
-    assert.deepEqual(init.result.serverInfo, { name: "odoo-json2", version: "0.1.2" });
+    assert.equal(SERVER_VERSION, "0.3.2");
+    assert.deepEqual(init.result.serverInfo, { name: "odoo-json2", version: SERVER_VERSION });
 
     client.send({ jsonrpc: "2.0", method: "notifications/initialized" });
 
@@ -302,7 +330,7 @@ await checkAsync("MCP stdio via npm-style bin symlink (npx launch)", async () =>
       capabilities: {},
       clientInfo: { name: "odoo-json2-test", version: "0.0.0" },
     });
-    assert.deepEqual(init.result.serverInfo, { name: "odoo-json2", version: "0.1.2" });
+    assert.deepEqual(init.result.serverInfo, { name: "odoo-json2", version: SERVER_VERSION });
     const listed = await client.request(2, "tools/list", {});
     assert.deepEqual(listed.result.tools.map((t) => t.name).sort(), ["odoo_call", "odoo_version"]);
   } finally {
@@ -385,6 +413,8 @@ await checkAsync("odoo_version GET /web/version without Authorization or databas
     });
     const text = toolText(rpc);
     assert.match(text, /"version": "19.0"/);
+    assert.match(text, /"account": "default"/);
+    assert.match(text, /"origin": "https:\/\/mycompany.example.com"/);
     assert.equal(fetchCalls[0].url, "https://mycompany.example.com/web/version");
     assert.equal(fetchCalls[0].method, "GET");
     assert.equal(fetchCalls[0].headers.Authorization, undefined);
@@ -455,6 +485,437 @@ await checkAsync("invalid model does not call fetch", async () => {
   assert.equal(rpc.result.isError, true);
   assert.match(toolText(rpc), /invalid path segment/);
   assert.equal(fetchCalls.length, 0);
+});
+
+const MULTI_ENV = {
+  ODOO_ENVIRONMENTS: "dev,test,prod",
+  ODOO_DEV_URL: "https://dev.example.com",
+  ODOO_DEV_API_KEY: "dev-key",
+  ODOO_DEV_DATABASE: "dev-db",
+  ODOO_TEST_URL: "https://test.example.com",
+  ODOO_TEST_API_KEY: "test-key",
+  ODOO_TEST_DATABASE: "test-db",
+  ODOO_PROD_URL: "https://prod.example.com",
+  ODOO_PROD_API_KEY: "prod-key",
+  ODOO_PROD_DATABASE: "prod-db",
+};
+
+check("loadEnvironments ignores pipeline leftovers such as ODOO_BASE_URL", () => {
+  const instances = loadEnvironments({
+    ODOO_URL: "https://legacy.example.com",
+    ODOO_API_KEY: "legacy-key",
+    ODOO_DATABASE: "legacy-db",
+    ODOO_BASE_URL: "https://sandbox.example.com",
+    ODOO_BASE_API_KEY: "",
+  });
+  assert.deepEqual(
+    instances.map((i) => i.name),
+    ["default"]
+  );
+});
+
+check("ODOO_ENVIRONMENTS can name a custom instance", () => {
+  const instances = loadEnvironments({
+    ODOO_ENVIRONMENTS: "qa",
+    ODOO_QA_URL: "https://qa.example.com",
+    ODOO_QA_API_KEY: "qa-key",
+    ODOO_QA_DATABASE: "qa-db",
+  });
+  assert.deepEqual(
+    instances.map((i) => i.name),
+    ["qa"]
+  );
+});
+
+check("loadEnvironments discovers Dev/Test/Prod and ignores legacy trio", () => {
+  const instances = loadEnvironments({
+    ...MULTI_ENV,
+    ODOO_URL: "https://legacy.example.com",
+    ODOO_API_KEY: "legacy-key",
+    ODOO_DATABASE: "legacy-db",
+  });
+  assert.deepEqual(
+    instances.map((i) => i.name),
+    ["dev", "test", "prod"]
+  );
+  assert.equal(isProductionEnvironment("prod"), true);
+  assert.equal(isProductionEnvironment("dev"), false);
+});
+
+check("resolveEnvironment never silently picks Prod", () => {
+  assert.equal(resolveEnvironment("dev", MULTI_ENV).url, "https://dev.example.com");
+  assert.equal(resolveEnvironment("PROD", MULTI_ENV).name, "prod");
+  assert.throws(() => resolveEnvironment(undefined, MULTI_ENV), /never the implicit default/);
+  assert.throws(() => resolveEnvironment("", MULTI_ENV), /Environment Local → Connect/);
+});
+
+check("tools/list has no environment enum — account is host-selected", () => {
+  const tools = listTools();
+  assert.deepEqual(
+    tools.map((t) => t.name),
+    ["odoo_call", "odoo_version"]
+  );
+  assert.equal(tools[0].inputSchema.properties.environment, undefined);
+  assert.equal(tools[0].inputSchema.required.includes("environment"), false);
+  assert.ok(tools[0].inputSchema.required.includes("model"));
+});
+
+await checkAsync("stdio multi-instance without a connected account does not fetch", async () => {
+  fetchCalls.length = 0;
+  const rpc = await handleJsonRpc(
+    {
+      jsonrpc: "2.0",
+      id: 20,
+      method: "tools/call",
+      params: { name: "odoo_call", arguments: { model: "res.partner", method: "search_read" } },
+    },
+    { env: MULTI_ENV }
+  );
+  assert.equal(rpc.result.isError, true);
+  assert.match(toolText(rpc), /Environment Local → Connect/);
+  assert.equal(fetchCalls.length, 0);
+});
+
+await checkAsync("connected account instance is used instead of env default", async () => {
+  fetchCalls.length = 0;
+  const rpc = await handleJsonRpc(
+    {
+      jsonrpc: "2.0",
+      id: 21,
+      method: "tools/call",
+      params: { name: "odoo_call", arguments: { model: "res.partner", method: "search_read" } },
+    },
+    {
+      env: MULTI_ENV,
+      instance: {
+        name: "test",
+        url: "https://test.example.com",
+        apiKey: "test-key",
+        database: "test-db",
+        urlVar: "connected account",
+        keyVar: "connected account API key",
+        dbVar: "connected account database",
+      },
+    }
+  );
+  assert.equal(rpc.result.isError, undefined);
+  assert.match(toolText(rpc), /Deco Addict/);
+  assert.equal(fetchCalls[0].url, "https://test.example.com/json/2/res.partner/search_read");
+  assert.equal(fetchCalls[0].headers.Authorization, "bearer test-key");
+});
+
+await checkAsync("explicit Prod account is allowed and still not implicit", async () => {
+  fetchCalls.length = 0;
+  const rpc = await handleJsonRpc(
+    {
+      jsonrpc: "2.0",
+      id: 22,
+      method: "tools/call",
+      params: { name: "odoo_version", arguments: {} },
+    },
+    {
+      instance: {
+        name: "prod",
+        url: "https://prod.example.com",
+        apiKey: "prod-key",
+        database: "prod-db",
+        urlVar: "connected account",
+        keyVar: "connected account API key",
+        dbVar: "connected account database",
+      },
+    }
+  );
+  assert.match(toolText(rpc), /"account": "prod"/);
+  assert.equal(fetchCalls[0].url, "https://prod.example.com/web/version");
+});
+
+function pkce() {
+  const verifier = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const challenge = createHash("sha256").update(verifier).digest("base64url");
+  return { verifier, challenge };
+}
+
+await checkAsync("HTTP OAuth connect Dev then call odoo_version on that account", async () => {
+  installMockFetch();
+  const store = createMemoryStore();
+  const http = await startHttp({ store, port: 0 });
+  const base = `http://127.0.0.1:${http.port}`;
+  try {
+    const prm = await (await realFetch(`${base}/.well-known/oauth-protected-resource`)).json();
+    assert.equal(prm.resource, `${base}/mcp`);
+    assert.deepEqual(authorizationServerMetadata(base).grant_types_supported, ["authorization_code", "refresh_token"]);
+    assert.equal(protectedResourceMetadata(base).authorization_servers[0], base);
+
+    const unauth = await realFetch(`${base}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
+    });
+    assert.equal(unauth.status, 401);
+    assert.match(unauth.headers.get("www-authenticate") || "", /resource_metadata=/);
+
+    const registered = await (
+      await realFetch(`${base}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          client_name: "cursor-test",
+          redirect_uris: ["http://localhost:8787/callback"],
+          token_endpoint_auth_method: "none",
+        }),
+      })
+    ).json();
+    const { verifier, challenge } = pkce();
+    const authorizeUrl = `${base}/oauth/authorize?response_type=code&client_id=${registered.client_id}&redirect_uri=${encodeURIComponent("http://localhost:8787/callback")}&code_challenge=${challenge}&code_challenge_method=S256&state=s1`;
+    const form = new URLSearchParams({
+      account: "dev",
+      url: "https://dev.example.com",
+      database: "dev-db",
+      api_key: "dev-key",
+    });
+    const posted = await realFetch(authorizeUrl, { method: "POST", body: form, redirect: "manual" });
+    assert.equal(posted.status, 302);
+    const location = new URL(posted.headers.get("location"));
+    assert.equal(location.searchParams.get("state"), "s1");
+    const code = location.searchParams.get("code");
+
+    const tokenBody = await (
+      await realFetch(`${base}/oauth/token`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          client_id: registered.client_id,
+          redirect_uri: "http://localhost:8787/callback",
+          code_verifier: verifier,
+        }),
+      })
+    ).json();
+    assert.ok(tokenBody.access_token);
+
+    fetchCalls.length = 0;
+    const mcp = await (
+      await realFetch(`${base}/mcp`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${tokenBody.access_token}`,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "odoo_version", arguments: {} } }),
+      })
+    ).json();
+    assert.match(mcp.result.content[0].text, /"account": "dev"/);
+    assert.equal(fetchCalls[0].url, "https://dev.example.com/web/version");
+
+    const listed = await (
+      await realFetch(`${base}/mcp`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${tokenBody.access_token}`,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 10, method: "tools/list" }),
+      })
+    ).json();
+    assert.deepEqual(
+      listed.result.tools.map((t) => t.name),
+      ["odoo_call", "odoo_version"]
+    );
+    assert.equal(listed.result.tools[0].inputSchema.properties.environment, undefined);
+  } finally {
+    await http.close();
+  }
+});
+
+check("parseMcpPath and resource lock match Notion-style suffixes", () => {
+  assert.deepEqual(parseMcpPath("/mcp"), { suffix: "", locked: "" });
+  assert.deepEqual(parseMcpPath("/mcp/dev"), { suffix: "dev", locked: "dev" });
+  assert.deepEqual(parseMcpPath("/mcp/prod"), { suffix: "prod", locked: "prod" });
+  assert.equal(parseMcpPath("/oauth/authorize"), null);
+  assert.equal(lockedAccountFromAuthorizeQuery({ resource: "https://odoo-json2.tylerjharden.dev/mcp/test" }), "test");
+  assert.equal(protectedResourceMetadata("https://odoo-json2.tylerjharden.dev", "dev").resource, "https://odoo-json2.tylerjharden.dev/mcp/dev");
+});
+
+await checkAsync("HTTP /mcp/dev 401 and Dev token is rejected on /mcp/prod", async () => {
+  const store = createMemoryStore();
+  const http = await startHttp({ store, port: 0 });
+  const base = `http://127.0.0.1:${http.port}`;
+  try {
+    const prm = await (await realFetch(`${base}/.well-known/oauth-protected-resource/mcp/dev`)).json();
+    assert.equal(prm.resource, `${base}/mcp/dev`);
+    assert.equal(prm.resource_name, "odoo-json2 dev");
+    const unauth = await realFetch(`${base}/mcp/dev`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    assert.equal(unauth.status, 401);
+    assert.match(unauth.headers.get("www-authenticate") || "", /oauth-protected-resource\/mcp\/dev/);
+
+    const registered = await (
+      await realFetch(`${base}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ redirect_uris: ["http://localhost:8787/callback"] }),
+      })
+    ).json();
+    const { verifier, challenge } = pkce();
+    const authorizeUrl = `${base}/oauth/authorize?response_type=code&client_id=${registered.client_id}&redirect_uri=${encodeURIComponent("http://localhost:8787/callback")}&code_challenge=${challenge}&code_challenge_method=S256&resource=${encodeURIComponent(`${base}/mcp/dev`)}`;
+    const posted = await realFetch(authorizeUrl, {
+      method: "POST",
+      body: new URLSearchParams({ url: "https://dev.example.com", database: "dev-db", api_key: "dev-key" }),
+      redirect: "manual",
+    });
+    assert.equal(posted.status, 302);
+    const code = new URL(posted.headers.get("location")).searchParams.get("code");
+    const tokenBody = await (
+      await realFetch(`${base}/oauth/token`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          client_id: registered.client_id,
+          redirect_uri: "http://localhost:8787/callback",
+          code_verifier: verifier,
+        }),
+      })
+    ).json();
+    const headers = { "content-type": "application/json", authorization: `Bearer ${tokenBody.access_token}` };
+    const okDev = await realFetch(`${base}/mcp/dev`, { method: "GET", headers });
+    assert.equal(okDev.status, 200);
+    assert.equal((await okDev.json()).account, "dev");
+    const prod = await realFetch(`${base}/mcp/prod`, { method: "GET", headers });
+    assert.equal(prod.status, 401);
+  } finally {
+    await http.close();
+  }
+});
+
+await checkAsync("authorize form does not default the account to Prod", async () => {
+  const http = await startHttp({ store: createMemoryStore(), port: 0 });
+  const base = `http://127.0.0.1:${http.port}`;
+  try {
+    const page = await (await realFetch(`${base}/oauth/authorize?client_id=x`)).text();
+    assert.match(page, /Choose Dev, Test, or Prod/);
+    assert.match(page, /selected disabled/);
+    assert.doesNotMatch(page, /option value="prod" selected/);
+    await pickEnvironment({}, { env: {} }).then(
+      () => {
+        throw new Error("expected no account");
+      },
+      (err) => {
+        assert.match(err.message, /Environment Local → Connect/);
+      }
+    );
+  } finally {
+    await http.close();
+  }
+});
+
+function mockBlobFetch() {
+  const files = new Map();
+  const storeId = "teststoreid";
+  const token = `vercel_blob_rw_${storeId}_secret`;
+  const fetchImpl = async (url, init = {}) => {
+    const method = (init.method || "GET").toUpperCase();
+    const u = new URL(url, "https://example.test");
+    if (method === "PUT") {
+      const pathname = u.searchParams.get("pathname");
+      files.set(pathname, String(init.body || ""));
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ url: `https://${storeId}.private.blob.vercel-storage.com/${pathname}` }),
+        text: async () => "{}",
+      };
+    }
+    const pathname = u.pathname.replace(/^\//, "");
+    if (!files.has(pathname)) {
+      return { ok: false, status: 404, text: async () => "not found" };
+    }
+    const body = files.get(pathname);
+    return { ok: true, status: 200, text: async () => body };
+  };
+  return { token, storeId, fetchImpl, files };
+}
+
+await checkAsync("durable Blob store survives a second isolate with the same bearer", async () => {
+  const blob = mockBlobFetch();
+  assert.equal(parseBlobStoreId(blob.token), blob.storeId);
+  assert.equal(parseBlobStoreId("vercel_blob_rw_store_c1JGan3ogrtP1NwR_secret"), "c1JGan3ogrtP1NwR");
+  const isolateA = createBlobJsonStore({ token: blob.token, fetchImpl: blob.fetchImpl, storeId: blob.storeId });
+  const httpA = await startHttp({ store: isolateA, port: 0 });
+  const base = `http://127.0.0.1:${httpA.port}`;
+  let accessToken;
+  try {
+    const registered = await (
+      await realFetch(`${base}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ redirect_uris: ["http://localhost:8787/callback"] }),
+      })
+    ).json();
+    const { verifier, challenge } = pkce();
+    const authorizeUrl = `${base}/oauth/authorize?response_type=code&client_id=${registered.client_id}&redirect_uri=${encodeURIComponent("http://localhost:8787/callback")}&code_challenge=${challenge}&code_challenge_method=S256&resource=${encodeURIComponent(`${base}/mcp/dev`)}`;
+    const posted = await realFetch(authorizeUrl, {
+      method: "POST",
+      body: new URLSearchParams({ url: "https://dev.example.com", database: "dev-db", api_key: "dev-key" }),
+      redirect: "manual",
+    });
+    const code = new URL(posted.headers.get("location")).searchParams.get("code");
+    const tokenBody = await (
+      await realFetch(`${base}/oauth/token`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          client_id: registered.client_id,
+          redirect_uri: "http://localhost:8787/callback",
+          code_verifier: verifier,
+        }),
+      })
+    ).json();
+    accessToken = tokenBody.access_token;
+    assert.ok(accessToken);
+    const first = await realFetch(`${base}/mcp/dev`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    assert.equal(first.status, 200);
+  } finally {
+    await httpA.close();
+  }
+
+  const isolateB = createBlobJsonStore({ token: blob.token, fetchImpl: blob.fetchImpl, storeId: blob.storeId });
+  const httpB = await startHttp({ store: isolateB, port: 0 });
+  const baseB = `http://127.0.0.1:${httpB.port}`;
+  try {
+    const later = await realFetch(`${baseB}/mcp/dev`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    assert.equal(later.status, 200);
+    assert.equal((await later.json()).account, "dev");
+    const prod = await realFetch(`${baseB}/mcp/prod`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    assert.equal(prod.status, 401);
+  } finally {
+    await httpB.close();
+  }
+});
+
+check("createRuntimeStore prefers Blob over a local file path", () => {
+  const blob = mockBlobFetch();
+  const store = createRuntimeStore({
+    BLOB_READ_WRITE_TOKEN: blob.token,
+    ODOO_JSON2_STORE: "/tmp/should-not-use.json",
+  });
+  assert.equal(typeof store.read().then, "function");
+  const file = createRuntimeStore({ ODOO_JSON2_STORE: "/tmp/odoo-json2-runtime-file.json" });
+  assert.equal(typeof createFileStore, "function");
+  file.write({ clients: { x: 1 }, codes: {}, tokens: {}, accounts: {} });
+  assert.equal(file.read().clients.x, 1);
 });
 
 process.stderr.write(`\n${passed} passed, ${failed} failed\n`);
