@@ -11,7 +11,19 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 
-import { handleJsonRpc, parseOdooOrigin, assertPathSegment, buildOdooCall, isEntrypoint } from "./server.mjs";
+import {
+  handleJsonRpc,
+  parseOdooOrigin,
+  assertPathSegment,
+  buildOdooCall,
+  isEntrypoint,
+  loadEnvironments,
+  resolveEnvironment,
+  isProductionEnvironment,
+  listTools,
+  elicitationParams,
+  SERVER_VERSION,
+} from "./server.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const DECO_ADDICT = [{ id: 25, name: "Deco Addict" }];
@@ -267,7 +279,8 @@ await checkAsync("MCP stdio initialize, tools/list, ping", async () => {
     });
     assert.equal(init.result.protocolVersion, "2025-03-26");
     assert.deepEqual(init.result.capabilities, { tools: {} });
-    assert.deepEqual(init.result.serverInfo, { name: "odoo-json2", version: "0.1.2" });
+    assert.equal(SERVER_VERSION, "0.2.0");
+    assert.deepEqual(init.result.serverInfo, { name: "odoo-json2", version: SERVER_VERSION });
 
     client.send({ jsonrpc: "2.0", method: "notifications/initialized" });
 
@@ -302,7 +315,7 @@ await checkAsync("MCP stdio via npm-style bin symlink (npx launch)", async () =>
       capabilities: {},
       clientInfo: { name: "odoo-json2-test", version: "0.0.0" },
     });
-    assert.deepEqual(init.result.serverInfo, { name: "odoo-json2", version: "0.1.2" });
+    assert.deepEqual(init.result.serverInfo, { name: "odoo-json2", version: SERVER_VERSION });
     const listed = await client.request(2, "tools/list", {});
     assert.deepEqual(listed.result.tools.map((t) => t.name).sort(), ["odoo_call", "odoo_version"]);
   } finally {
@@ -385,6 +398,8 @@ await checkAsync("odoo_version GET /web/version without Authorization or databas
     });
     const text = toolText(rpc);
     assert.match(text, /"version": "19.0"/);
+    assert.match(text, /"environment": "default"/);
+    assert.match(text, /"origin": "https:\/\/mycompany.example.com"/);
     assert.equal(fetchCalls[0].url, "https://mycompany.example.com/web/version");
     assert.equal(fetchCalls[0].method, "GET");
     assert.equal(fetchCalls[0].headers.Authorization, undefined);
@@ -455,6 +470,225 @@ await checkAsync("invalid model does not call fetch", async () => {
   assert.equal(rpc.result.isError, true);
   assert.match(toolText(rpc), /invalid path segment/);
   assert.equal(fetchCalls.length, 0);
+});
+
+const MULTI_ENV = {
+  ODOO_ENVIRONMENTS: "dev,test,prod",
+  ODOO_DEV_URL: "https://dev.example.com",
+  ODOO_DEV_API_KEY: "dev-key",
+  ODOO_DEV_DATABASE: "dev-db",
+  ODOO_TEST_URL: "https://test.example.com",
+  ODOO_TEST_API_KEY: "test-key",
+  ODOO_TEST_DATABASE: "test-db",
+  ODOO_PROD_URL: "https://prod.example.com",
+  ODOO_PROD_API_KEY: "prod-key",
+  ODOO_PROD_DATABASE: "prod-db",
+};
+
+check("loadEnvironments ignores pipeline leftovers such as ODOO_BASE_URL", () => {
+  const instances = loadEnvironments({
+    ODOO_URL: "https://legacy.example.com",
+    ODOO_API_KEY: "legacy-key",
+    ODOO_DATABASE: "legacy-db",
+    ODOO_BASE_URL: "https://sandbox.example.com",
+    ODOO_BASE_API_KEY: "",
+  });
+  assert.deepEqual(
+    instances.map((i) => i.name),
+    ["default"]
+  );
+});
+
+check("ODOO_ENVIRONMENTS can name a custom instance", () => {
+  const instances = loadEnvironments({
+    ODOO_ENVIRONMENTS: "qa",
+    ODOO_QA_URL: "https://qa.example.com",
+    ODOO_QA_API_KEY: "qa-key",
+    ODOO_QA_DATABASE: "qa-db",
+  });
+  assert.deepEqual(
+    instances.map((i) => i.name),
+    ["qa"]
+  );
+});
+
+check("loadEnvironments discovers Dev/Test/Prod and ignores legacy trio", () => {
+  const instances = loadEnvironments({
+    ...MULTI_ENV,
+    ODOO_URL: "https://legacy.example.com",
+    ODOO_API_KEY: "legacy-key",
+    ODOO_DATABASE: "legacy-db",
+  });
+  assert.deepEqual(
+    instances.map((i) => i.name),
+    ["dev", "test", "prod"]
+  );
+  assert.equal(isProductionEnvironment("prod"), true);
+  assert.equal(isProductionEnvironment("dev"), false);
+});
+
+check("resolveEnvironment never silently picks Prod", () => {
+  assert.equal(resolveEnvironment("dev", MULTI_ENV).url, "https://dev.example.com");
+  assert.equal(resolveEnvironment("PROD", MULTI_ENV).name, "prod");
+  assert.throws(() => resolveEnvironment(undefined, MULTI_ENV), /Choose an Odoo environment/);
+  assert.throws(() => resolveEnvironment("", MULTI_ENV), /never the implicit default/);
+  assert.doesNotMatch(String(resolveEnvironment("dev", MULTI_ENV).name), /prod/);
+});
+
+check("single named environment does not require a picker", () => {
+  const onlyDev = {
+    ODOO_DEV_URL: "https://dev.example.com",
+    ODOO_DEV_API_KEY: "dev-key",
+    ODOO_DEV_DATABASE: "dev-db",
+  };
+  assert.equal(resolveEnvironment(undefined, onlyDev).name, "dev");
+  const tools = listTools(onlyDev);
+  assert.equal(tools[0].inputSchema.required.includes("environment"), false);
+});
+
+check("tools/list requires environment enum when multiple instances exist", () => {
+  const tools = listTools(MULTI_ENV);
+  assert.deepEqual(
+    tools.map((t) => t.name),
+    ["odoo_call", "odoo_version"]
+  );
+  const call = tools[0];
+  assert.ok(call.inputSchema.required.includes("environment"));
+  assert.deepEqual(call.inputSchema.properties.environment.enum, ["dev", "test", "prod"]);
+  const version = tools[1];
+  assert.ok(version.inputSchema.required.includes("environment"));
+  const elicit = elicitationParams(loadEnvironments(MULTI_ENV));
+  assert.deepEqual(elicit.requestedSchema.properties.environment.enum, ["dev", "test", "prod"]);
+  assert.match(elicit.message, /never selected automatically/);
+});
+
+await checkAsync("multi-instance odoo_call without environment does not fetch", async () => {
+  fetchCalls.length = 0;
+  const rpc = await handleJsonRpc(
+    {
+      jsonrpc: "2.0",
+      id: 20,
+      method: "tools/call",
+      params: { name: "odoo_call", arguments: { model: "res.partner", method: "search_read" } },
+    },
+    { env: MULTI_ENV }
+  );
+  assert.equal(rpc.result.isError, true);
+  assert.match(toolText(rpc), /Choose an Odoo environment/);
+  assert.match(toolText(rpc), /prod \(Prod, production — never implicit\)/);
+  assert.equal(fetchCalls.length, 0);
+});
+
+await checkAsync("multi-instance odoo_call uses the chosen environment", async () => {
+  fetchCalls.length = 0;
+  const rpc = await handleJsonRpc(
+    {
+      jsonrpc: "2.0",
+      id: 21,
+      method: "tools/call",
+      params: {
+        name: "odoo_call",
+        arguments: { environment: "test", model: "res.partner", method: "search_read" },
+      },
+    },
+    { env: MULTI_ENV }
+  );
+  assert.equal(rpc.result.isError, undefined);
+  assert.match(toolText(rpc), /Deco Addict/);
+  assert.equal(fetchCalls[0].url, "https://test.example.com/json/2/res.partner/search_read");
+  assert.equal(fetchCalls[0].headers.Authorization, "bearer test-key");
+  assert.equal(fetchCalls[0].headers["X-Odoo-Database"], "test-db");
+});
+
+await checkAsync("explicit Prod is allowed and still not implicit", async () => {
+  fetchCalls.length = 0;
+  const rpc = await handleJsonRpc(
+    {
+      jsonrpc: "2.0",
+      id: 22,
+      method: "tools/call",
+      params: { name: "odoo_version", arguments: { environment: "prod" } },
+    },
+    { env: MULTI_ENV }
+  );
+  assert.match(toolText(rpc), /"environment": "prod"/);
+  assert.equal(fetchCalls[0].url, "https://prod.example.com/web/version");
+});
+
+await checkAsync("elicitation accept supplies the missing environment", async () => {
+  fetchCalls.length = 0;
+  let elicited = 0;
+  const rpc = await handleJsonRpc(
+    {
+      jsonrpc: "2.0",
+      id: 23,
+      method: "tools/call",
+      params: { name: "odoo_version", arguments: {} },
+    },
+    {
+      env: MULTI_ENV,
+      elicit: async (instances) => {
+        elicited += 1;
+        assert.deepEqual(
+          instances.map((i) => i.name),
+          ["dev", "test", "prod"]
+        );
+        return "dev";
+      },
+    }
+  );
+  assert.equal(elicited, 1);
+  assert.match(toolText(rpc), /"environment": "dev"/);
+  assert.equal(fetchCalls[0].url, "https://dev.example.com/web/version");
+});
+
+await checkAsync("MCP stdio elicitation/create prompts when environment is omitted", async () => {
+  const client = spawnServer(MULTI_ENV);
+  try {
+    await client.request(1, "initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: { elicitation: {} },
+      clientInfo: { name: "odoo-json2-test", version: "0.0.0" },
+    });
+    client.send({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: { name: "odoo_version", arguments: {} },
+    });
+    const elicit = await client.recv();
+    assert.equal(elicit.method, "elicitation/create");
+    assert.match(elicit.params.message, /never selected automatically/);
+    assert.deepEqual(elicit.params.requestedSchema.properties.environment.enum, ["dev", "test", "prod"]);
+    client.send({
+      jsonrpc: "2.0",
+      id: elicit.id,
+      result: { action: "cancel" },
+    });
+    const result = await client.recv();
+    assert.equal(result.id, 2);
+    assert.equal(result.result.isError, true);
+    assert.match(result.result.content.map((c) => c.text).join("\n"), /Choose an Odoo environment/);
+  } finally {
+    client.close();
+  }
+});
+
+await checkAsync("MCP stdio lists required environment enum for Dev/Test/Prod", async () => {
+  const client = spawnServer(MULTI_ENV);
+  try {
+    await client.request(1, "initialize", {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "odoo-json2-test", version: "0.0.0" },
+    });
+    const listed = await client.request(2, "tools/list", {});
+    const call = listed.result.tools.find((t) => t.name === "odoo_call");
+    assert.ok(call.inputSchema.required.includes("environment"));
+    assert.deepEqual(call.inputSchema.properties.environment.enum, ["dev", "test", "prod"]);
+  } finally {
+    client.close();
+  }
 });
 
 process.stderr.write(`\n${passed} passed, ${failed} failed\n`);

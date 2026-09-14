@@ -1,6 +1,6 @@
 {
   "name": "odoo-json2",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "Cursor plugin: MCP tools for Odoo 19 External JSON-2 (POST /json/2/{model}/{method}).",

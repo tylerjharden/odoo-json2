@@ -21,10 +21,12 @@ Do not add per-model tools. Do not use XML-RPC (`/xmlrpc`) or JSON-RPC (`/jsonrp
 ## OdooCall
 
 ```
-OdooCall = { model, method, ids?, context?, params }
+OdooCall = { environment?, model, method, ids?, context?, params }
 ```
 
-The server `POST`s `{ODOO_URL}/json/2/{model}/{method}` with:
+When more than one Odoo instance is configured (`ODOO_DEV_URL` / `ODOO_TEST_URL` / `ODOO_PROD_URL`), **`environment` is required** (`dev`, `test`, or `prod`). Do not omit it and do not assume Prod. IPP ladder: Dev until verified, Test after merge to `dev`, Prod after merge to `main`. If the tool errors with “Choose an Odoo environment”, ask the user which instance and retry. A single-instance `ODOO_URL` setup may omit `environment`.
+
+The server `POST`s `{origin}/json/2/{model}/{method}` with:
 
 - `Authorization: bearer {ODOO_API_KEY}` (lowercase `bearer`, as in the Odoo docs)
 - `Content-Type: application/json; charset=utf-8`
@@ -72,4 +74,4 @@ Put these on `odoo_call` as `method`. Confirm kwargs on `/doc` for that database
 - External API access is on **Custom** Odoo pricing plans only — not One App Free or Standard.
 - UI-created keys last **at most three months** and must be rotated. The value is shown once at creation.
 
-If `ODOO_URL`, `ODOO_API_KEY`, or `ODOO_DATABASE` is missing, stop and ask the user to set the Cursor plugin variables. Do not invent a host, key, or database name.
+If no environment is configured, or a named env is missing its URL / API key / database, stop and ask the user to set the Cursor plugin or Cloud MCP variables. Do not invent a host, key, or database name.

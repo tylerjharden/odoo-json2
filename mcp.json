@@ -5,7 +5,17 @@
       "env": {
         "ODOO_URL": "${ODOO_URL}",
         "ODOO_API_KEY": "${ODOO_API_KEY}",
-        "ODOO_DATABASE": "${ODOO_DATABASE}"
+        "ODOO_DATABASE": "${ODOO_DATABASE}",
+        "ODOO_ENVIRONMENTS": "${ODOO_ENVIRONMENTS}",
+        "ODOO_DEV_URL": "${ODOO_DEV_URL}",
+        "ODOO_DEV_API_KEY": "${ODOO_DEV_API_KEY}",
+        "ODOO_DEV_DATABASE": "${ODOO_DEV_DATABASE}",
+        "ODOO_TEST_URL": "${ODOO_TEST_URL}",
+        "ODOO_TEST_API_KEY": "${ODOO_TEST_API_KEY}",
+        "ODOO_TEST_DATABASE": "${ODOO_TEST_DATABASE}",
+        "ODOO_PROD_URL": "${ODOO_PROD_URL}",
+        "ODOO_PROD_API_KEY": "${ODOO_PROD_API_KEY}",
+        "ODOO_PROD_DATABASE": "${ODOO_PROD_DATABASE}"
       }
     }
   }

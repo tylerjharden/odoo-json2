@@ -1,7 +1,7 @@
 {
   "name": "odoo-json2",
-  "version": "0.1.2",
-  "description": "MCP tools for Odoo 19 External JSON-2 (POST /json/2/{model}/{method}).",
+  "version": "0.2.0",
+  "description": "MCP tools for Odoo 19 External JSON-2 (POST /json/2/{model}/{method}). Multi-instance Dev/Test/Prod.",
   "author": {
     "name": "Tyler Harden",
     "email": "root@tylerjharden.dev"
@@ -32,13 +32,50 @@
       "ODOO_DATABASE": {
         "type": "string",
         "title": "Odoo database",
-        "description": "Database name. Sent as X-Odoo-Database on every JSON-2 call (required)."
+        "description": "Single-instance database name. Ignored when named Dev/Test/Prod vars are set."
+      },
+      "ODOO_ENVIRONMENTS": {
+        "type": "string",
+        "title": "Odoo environments",
+        "description": "Optional comma list that sets picker order, e.g. dev,test,prod. Prod is never the implicit default."
+      },
+      "ODOO_DEV_URL": {
+        "type": "string",
+        "title": "Dev Odoo URL",
+        "description": "Dev origin, e.g. https://ipp-dev.odoo.com. Use with ODOO_DEV_API_KEY and ODOO_DEV_DATABASE."
+      },
+      "ODOO_DEV_API_KEY": {
+        "type": "string",
+        "title": "Dev Odoo API key"
+      },
+      "ODOO_DEV_DATABASE": {
+        "type": "string",
+        "title": "Dev Odoo database"
+      },
+      "ODOO_TEST_URL": {
+        "type": "string",
+        "title": "Test Odoo URL"
+      },
+      "ODOO_TEST_API_KEY": {
+        "type": "string",
+        "title": "Test Odoo API key"
+      },
+      "ODOO_TEST_DATABASE": {
+        "type": "string",
+        "title": "Test Odoo database"
+      },
+      "ODOO_PROD_URL": {
+        "type": "string",
+        "title": "Prod Odoo URL"
+      },
+      "ODOO_PROD_API_KEY": {
+        "type": "string",
+        "title": "Prod Odoo API key"
+      },
+      "ODOO_PROD_DATABASE": {
+        "type": "string",
+        "title": "Prod Odoo database"
       }
-    },
-    "required": [
-      "ODOO_URL",
-      "ODOO_API_KEY",
-      "ODOO_DATABASE"
-    ]
+    }
   }
 }
