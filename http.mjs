@@ -118,7 +118,13 @@ export function createSharedJsonStore(backend) {
 }
 
 export function parseBlobStoreId(token) {
-  const parts = String(token || "").split("_");
+  const raw = String(token || "");
+  const match = raw.match(/^vercel_blob_rw_(.+)_([^_]+)$/);
+  if (match) {
+    const id = match[1];
+    return id.startsWith("store_") ? id.slice("store_".length) : id;
+  }
+  const parts = raw.split("_");
   return parts[3] || "";
 }
 

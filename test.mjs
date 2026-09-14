@@ -840,6 +840,7 @@ function mockBlobFetch() {
 await checkAsync("durable Blob store survives a second isolate with the same bearer", async () => {
   const blob = mockBlobFetch();
   assert.equal(parseBlobStoreId(blob.token), blob.storeId);
+  assert.equal(parseBlobStoreId("vercel_blob_rw_store_c1JGan3ogrtP1NwR_secret"), "c1JGan3ogrtP1NwR");
   const isolateA = createBlobJsonStore({ token: blob.token, fetchImpl: blob.fetchImpl, storeId: blob.storeId });
   const httpA = await startHttp({ store: isolateA, port: 0 });
   const base = `http://127.0.0.1:${httpA.port}`;
