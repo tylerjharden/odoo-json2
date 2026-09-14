@@ -24,7 +24,7 @@ Do not add per-model tools. Do not use XML-RPC (`/xmlrpc`) or JSON-RPC (`/jsonrp
 OdooCall = { model, method, ids?, context?, params }
 ```
 
-The Odoo instance comes from the **one OAuth connection** on this Cursor surface (Configure → Environment Local → Connected). Do not invent an `environment` tool argument. Cursor does not list named Dev/Test/Prod rows or Add Another Account for this plugin. If nothing is connected, ask the user to Connect and complete the hosted form (Dev first). Prod is never implicit. IPP ladder: Dev until verified, Test after merge to `dev`, Prod after merge to `main`.
+The Odoo instance comes from the connected HTTP MCP (`odoo-json2-dev` / `-test` / `-prod` on `/mcp/dev` etc.) for this Cursor surface (Local, Cloud, or Cloud — ipp). Do not invent an `environment` tool argument. If nothing is connected, ask the user to Connect on the matching server. Prod is never implicit. IPP ladder: Dev until verified, Test after merge to `dev`, Prod after merge to `main`.
 
 The server `POST`s `{origin}/json/2/{model}/{method}` with:
 

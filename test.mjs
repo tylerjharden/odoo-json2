@@ -30,6 +30,8 @@ import {
   createMemoryStore,
   authorizationServerMetadata,
   protectedResourceMetadata,
+  parseMcpPath,
+  lockedAccountFromAuthorizeQuery,
 } from "./http.mjs";
 
 const realFetch = globalThis.fetch.bind(globalThis);
@@ -288,7 +290,7 @@ await checkAsync("MCP stdio initialize, tools/list, ping", async () => {
     });
     assert.equal(init.result.protocolVersion, "2025-03-26");
     assert.deepEqual(init.result.capabilities, { tools: {} });
-    assert.equal(SERVER_VERSION, "0.3.0");
+    assert.equal(SERVER_VERSION, "0.3.1");
     assert.deepEqual(init.result.serverInfo, { name: "odoo-json2", version: SERVER_VERSION });
 
     client.send({ jsonrpc: "2.0", method: "notifications/initialized" });
@@ -717,6 +719,67 @@ await checkAsync("HTTP OAuth connect Dev then call odoo_version on that account"
       ["odoo_call", "odoo_version"]
     );
     assert.equal(listed.result.tools[0].inputSchema.properties.environment, undefined);
+  } finally {
+    await http.close();
+  }
+});
+
+check("parseMcpPath and resource lock match Notion-style suffixes", () => {
+  assert.deepEqual(parseMcpPath("/mcp"), { suffix: "", locked: "" });
+  assert.deepEqual(parseMcpPath("/mcp/dev"), { suffix: "dev", locked: "dev" });
+  assert.deepEqual(parseMcpPath("/mcp/prod"), { suffix: "prod", locked: "prod" });
+  assert.equal(parseMcpPath("/oauth/authorize"), null);
+  assert.equal(lockedAccountFromAuthorizeQuery({ resource: "https://odoo-json2.tylerjharden.dev/mcp/test" }), "test");
+  assert.equal(protectedResourceMetadata("https://odoo-json2.tylerjharden.dev", "dev").resource, "https://odoo-json2.tylerjharden.dev/mcp/dev");
+});
+
+await checkAsync("HTTP /mcp/dev 401 and Dev token is rejected on /mcp/prod", async () => {
+  const store = createMemoryStore();
+  const http = await startHttp({ store, port: 0 });
+  const base = `http://127.0.0.1:${http.port}`;
+  try {
+    const prm = await (await realFetch(`${base}/.well-known/oauth-protected-resource/mcp/dev`)).json();
+    assert.equal(prm.resource, `${base}/mcp/dev`);
+    assert.equal(prm.resource_name, "odoo-json2 dev");
+    const unauth = await realFetch(`${base}/mcp/dev`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    assert.equal(unauth.status, 401);
+    assert.match(unauth.headers.get("www-authenticate") || "", /oauth-protected-resource\/mcp\/dev/);
+
+    const registered = await (
+      await realFetch(`${base}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ redirect_uris: ["http://localhost:8787/callback"] }),
+      })
+    ).json();
+    const { verifier, challenge } = pkce();
+    const authorizeUrl = `${base}/oauth/authorize?response_type=code&client_id=${registered.client_id}&redirect_uri=${encodeURIComponent("http://localhost:8787/callback")}&code_challenge=${challenge}&code_challenge_method=S256&resource=${encodeURIComponent(`${base}/mcp/dev`)}`;
+    const posted = await realFetch(authorizeUrl, {
+      method: "POST",
+      body: new URLSearchParams({ url: "https://dev.example.com", database: "dev-db", api_key: "dev-key" }),
+      redirect: "manual",
+    });
+    assert.equal(posted.status, 302);
+    const code = new URL(posted.headers.get("location")).searchParams.get("code");
+    const tokenBody = await (
+      await realFetch(`${base}/oauth/token`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          client_id: registered.client_id,
+          redirect_uri: "http://localhost:8787/callback",
+          code_verifier: verifier,
+        }),
+      })
+    ).json();
+    const headers = { "content-type": "application/json", authorization: `Bearer ${tokenBody.access_token}` };
+    const okDev = await realFetch(`${base}/mcp/dev`, { method: "GET", headers });
+    assert.equal(okDev.status, 200);
+    assert.equal((await okDev.json()).account, "dev");
+    const prod = await realFetch(`${base}/mcp/prod`, { method: "GET", headers });
+    assert.equal(prod.status, 401);
   } finally {
     await http.close();
   }

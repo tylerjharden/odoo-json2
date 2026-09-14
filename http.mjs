@@ -123,8 +123,26 @@ function publicOrigin(req, fallback) {
   return `${proto}://${host}`;
 }
 
-function mcpResource(origin) {
-  return `${origin.replace(/\/$/, "")}/mcp`;
+const ACCOUNT_SUFFIXES = new Set(["dev", "test", "prod"]);
+
+function mcpResource(origin, suffix = "") {
+  const base = `${origin.replace(/\/$/, "")}/mcp`;
+  return suffix ? `${base}/${suffix}` : base;
+}
+
+export function parseMcpPath(pathname) {
+  if (pathname === "/mcp" || pathname === "/") return { suffix: "", locked: "" };
+  const match = /^\/mcp\/(dev|test|prod)\/?$/.exec(pathname || "");
+  if (!match) return null;
+  return { suffix: match[1], locked: match[1] };
+}
+
+export function lockedAccountFromAuthorizeQuery(query = {}) {
+  const resource = String(query.resource || "");
+  const fromResource = /\/mcp\/(dev|test|prod)\/?$/.exec(resource);
+  if (fromResource) return fromResource[1];
+  const hint = normalizeEnvironmentName(query.login_hint || query.account || "");
+  return ACCOUNT_SUFFIXES.has(hint) ? hint : "";
 }
 
 function isAllowedRedirect(uri, registered = []) {
@@ -161,8 +179,10 @@ function text(res, status, body, contentType = "text/plain; charset=utf-8") {
   res.end(body);
 }
 
-function unauthorized(res, origin) {
-  const metadata = `${origin}/.well-known/oauth-protected-resource`;
+function unauthorized(res, origin, suffix = "") {
+  const metadata = suffix
+    ? `${origin}/.well-known/oauth-protected-resource/mcp/${suffix}`
+    : `${origin}/.well-known/oauth-protected-resource`;
   json(
     res,
     401,
@@ -194,23 +214,35 @@ export function authorizationServerMetadata(origin) {
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
-    scopes_supported: ["odoo"],
+    scopes_supported: ["default", "odoo"],
   };
 }
 
-export function protectedResourceMetadata(origin) {
-  const resource = mcpResource(origin);
+export function protectedResourceMetadata(origin, suffix = "") {
   return {
-    resource,
+    resource: mcpResource(origin, suffix),
     authorization_servers: [origin],
     bearer_methods_supported: ["header"],
-    scopes_supported: ["odoo"],
+    scopes_supported: ["default", "odoo"],
+    resource_name: suffix ? `odoo-json2 ${suffix}` : "odoo-json2 MCP",
   };
 }
 
-function authorizePage({ origin, query, error }) {
+function authorizePage({ origin, query, error, locked = "" }) {
   const q = new URLSearchParams(query).toString();
   const err = error ? `<p class="err">${escapeHtml(error)}</p>` : "";
+  const lockLabel = locked ? displayEnvironmentName(locked) : "";
+  const accountSelect = locked
+    ? `<input type="hidden" name="account" value="${escapeHtml(locked)}">
+  <p>This MCP URL is <strong>${escapeHtml(lockLabel)}</strong>. Prod is never selected unless this URL is /mcp/prod.</p>`
+    : `<label for="account">Account</label>
+  <select id="account" name="account" required>
+    <option value="" selected disabled>Choose Dev, Test, or Prod…</option>
+    <option value="dev">Dev</option>
+    <option value="test">Test</option>
+    <option value="prod">Prod (explicit only)</option>
+    <option value="custom">Custom name…</option>
+  </select>`;
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Connect an Odoo account</title>
 <style>
@@ -222,17 +254,10 @@ function authorizePage({ origin, query, error }) {
   .hint { color: #555; font-size: 13px; }
 </style></head><body>
 <h1>Connect an Odoo account</h1>
-<p>This login fills the one Configure slot for this Cursor surface (Local or Cloud). Choose Dev unless you mean Test or Prod. Prod is never selected automatically. Cursor will show Connected / Logout, not a named account row.</p>
+<p>Connect this Cursor surface (Local, Cloud, or Cloud — ipp). Named Dev / Test / Prod slots are the <code>/mcp/dev</code>, <code>/mcp/test</code>, and <code>/mcp/prod</code> MCP URLs.</p>
 ${err}
 <form method="post" action="/oauth/authorize?${escapeHtml(q)}">
-  <label for="account">Account</label>
-  <select id="account" name="account" required>
-    <option value="" selected disabled>Choose Dev, Test, or Prod…</option>
-    <option value="dev">Dev</option>
-    <option value="test">Test</option>
-    <option value="prod">Prod (explicit only)</option>
-    <option value="custom">Custom name…</option>
-  </select>
+  ${accountSelect}
   <label for="account_custom">Custom name</label>
   <input id="account_custom" name="account_custom" placeholder="staging" autocomplete="off">
   <label for="url">Odoo URL</label>
@@ -294,8 +319,9 @@ export function createHttpHandler(options = {}) {
         return;
       }
 
-      if (req.method === "GET" && (url.pathname === "/.well-known/oauth-protected-resource" || url.pathname === "/.well-known/oauth-protected-resource/mcp")) {
-        json(res, 200, protectedResourceMetadata(origin));
+      const prmMatch = /^\/\.well-known\/oauth-protected-resource(?:\/mcp(?:\/(dev|test|prod))?)?$/.exec(url.pathname);
+      if (req.method === "GET" && prmMatch) {
+        json(res, 200, protectedResourceMetadata(origin, prmMatch[1] || ""));
         return;
       }
 
@@ -339,7 +365,8 @@ export function createHttpHandler(options = {}) {
 
       if (url.pathname === "/oauth/authorize" && req.method === "GET") {
         const params = Object.fromEntries(url.searchParams);
-        text(res, 200, authorizePage({ origin, query: params }), "text/html; charset=utf-8");
+        const locked = lockedAccountFromAuthorizeQuery(params);
+        text(res, 200, authorizePage({ origin, query: params, locked }), "text/html; charset=utf-8");
         return;
       }
 
@@ -353,30 +380,35 @@ export function createHttpHandler(options = {}) {
         const challenge = params.code_challenge || "";
         const method = params.code_challenge_method || "S256";
         const client = store.read().clients[clientId];
+        const locked = lockedAccountFromAuthorizeQuery(params);
         if (!client || !isAllowedRedirect(redirectUri, client.redirect_uris)) {
-          text(res, 400, authorizePage({ origin, query: params, error: "Unknown OAuth client or redirect URI." }), "text/html; charset=utf-8");
+          text(res, 400, authorizePage({ origin, query: params, locked, error: "Unknown OAuth client or redirect URI." }), "text/html; charset=utf-8");
           return;
         }
         if (method !== "S256" || !challenge) {
-          text(res, 400, authorizePage({ origin, query: params, error: "PKCE S256 is required." }), "text/html; charset=utf-8");
+          text(res, 400, authorizePage({ origin, query: params, locked, error: "PKCE S256 is required." }), "text/html; charset=utf-8");
           return;
         }
-        let accountName = normalizeEnvironmentName(form.account === "custom" ? form.account_custom : form.account);
+        let accountName = locked || normalizeEnvironmentName(form.account === "custom" ? form.account_custom : form.account);
+        if (locked && accountName !== locked) {
+          text(res, 400, authorizePage({ origin, query: params, locked, error: `This MCP URL is locked to ${displayEnvironmentName(locked)}.` }), "text/html; charset=utf-8");
+          return;
+        }
         if (!accountName) {
-          text(res, 400, authorizePage({ origin, query: params, error: "Choose an account name. Prod is never the default." }), "text/html; charset=utf-8");
+          text(res, 400, authorizePage({ origin, query: params, locked, error: "Choose an account name. Prod is never the default." }), "text/html; charset=utf-8");
           return;
         }
         let originOdoo;
         try {
           originOdoo = parseOdooOrigin(form.url, "Odoo URL");
         } catch (err) {
-          text(res, 400, authorizePage({ origin, query: params, error: err.message }), "text/html; charset=utf-8");
+          text(res, 400, authorizePage({ origin, query: params, locked, error: err.message }), "text/html; charset=utf-8");
           return;
         }
         const apiKey = String(form.api_key || "").trim();
         const database = String(form.database || "").trim();
         if (!apiKey || !database) {
-          text(res, 400, authorizePage({ origin, query: params, error: "API key and database are required." }), "text/html; charset=utf-8");
+          text(res, 400, authorizePage({ origin, query: params, locked, error: "API key and database are required." }), "text/html; charset=utf-8");
           return;
         }
         const accountId = token();
@@ -461,11 +493,12 @@ export function createHttpHandler(options = {}) {
         return;
       }
 
-      if (url.pathname === "/mcp" || url.pathname === "/") {
+      const mcpPath = parseMcpPath(url.pathname);
+      if (mcpPath) {
         if (req.method === "GET") {
           const account = lookupAccount(store, bearer(req));
-          if (!account) {
-            unauthorized(res, origin);
+          if (!account || (mcpPath.locked && account.name !== mcpPath.locked)) {
+            unauthorized(res, origin, mcpPath.suffix);
             return;
           }
           json(res, 200, { status: "ok", account: account.name, production: account.production === true });
@@ -476,8 +509,8 @@ export function createHttpHandler(options = {}) {
           return;
         }
         const account = lookupAccount(store, bearer(req));
-        if (!account) {
-          unauthorized(res, origin);
+        if (!account || (mcpPath.locked && account.name !== mcpPath.locked)) {
+          unauthorized(res, origin, mcpPath.suffix);
           return;
         }
         const raw = await readBody(req);

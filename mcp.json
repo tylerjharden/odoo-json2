@@ -1,8 +1,14 @@
 {
-  "mcpServers": {
-    "odoo-json2": {
-      "type": "http",
-      "url": "https://odoo-json2.tylerjharden.dev/mcp"
-    }
+  "odoo-json2-dev": {
+    "type": "http",
+    "url": "https://odoo-json2.tylerjharden.dev/mcp/dev"
+  },
+  "odoo-json2-test": {
+    "type": "http",
+    "url": "https://odoo-json2.tylerjharden.dev/mcp/test"
+  },
+  "odoo-json2-prod": {
+    "type": "http",
+    "url": "https://odoo-json2.tylerjharden.dev/mcp/prod"
   }
 }

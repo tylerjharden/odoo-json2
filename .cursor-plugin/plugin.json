@@ -1,7 +1,7 @@
 {
   "name": "odoo-json2",
-  "version": "0.3.0",
-  "description": "Odoo 19 External JSON-2 MCP. One OAuth connection per Cursor surface (Local / Cloud); tools odoo_call and odoo_version.",
+  "version": "0.3.1",
+  "description": "Odoo 19 External JSON-2 MCP. Named Dev / Test / Prod HTTP URLs plus one OAuth slot per Cursor surface.",
   "author": {
     "name": "Tyler Harden",
     "email": "root@tylerjharden.dev"

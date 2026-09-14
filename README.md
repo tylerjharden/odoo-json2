@@ -24,23 +24,29 @@ The `odoo-json2` skill documents `search`, `search_read`, `read`, `create`, `wri
 - An Odoo 19 database on a **Custom** pricing plan (the external API is not available on One App Free or Standard).
 - A user API key.
 
-## Install (HTTP OAuth — one connection per surface)
+## Install (match the Notion Configure sheet)
 
-[makenotion/cursor-notion-plugin](https://github.com/makenotion/cursor-notion-plugin) is only `name: notion-workspace` (no `variables`) plus HTTP `mcp.json`. We ship the same plugin shape. Cursor still **does not** give third-party plugins Notion’s named Connected list or **+ Add Another Account**. That chrome is host-only (Notion / Gmail). There is no plugin.json or OAuth metadata field that unlocks it.
+[makenotion/cursor-notion-plugin](https://github.com/makenotion/cursor-notion-plugin) `mcp.json` is **unwrapped** (no `mcpServers` key):
 
-What Desktop Configure shows after a successful OAuth:
+```json
+{ "notion": { "type": "http", "url": "https://mcp.notion.com/mcp" } }
+```
 
-| Sheet row | What it is |
-| --- | --- |
-| Resource / Environment | **Local** (or Cloud later). Cursor surface, not an Odoo env name. |
-| Plugin toggle | Enable `odoo-json2`. |
-| Connected + Logout | **One** OAuth slot for this plugin on that surface. |
-| Tools | `odoo_call`, `odoo_version`. |
-| Dev / Test / Prod labels | **Not shown.** URL / database / key stay on the MCP host. |
+`plugin.json` is only `name` / metadata (no `variables`). Cursor’s plugins reference does **not** document a Notion-only flag or an accounts API. Notion’s Environment rows on that sheet are **Cursor surfaces** (`Local`, `Cloud`, `Cloud — ipp`), each with Connect / Logout.
 
-Our authorize HTML still asks which instance (Dev / Test / Prod) when you **Connect**. That name is not drawn in Configure. Prod is never preselected. Replacing the slot: Logout, then Connect again.
+0.3.1 copies that `mcp.json` shape and ships **three** HTTP resources so Dev / Test / Prod are separate connections (smallest workaround if **+ Add Another Account** still does not appear after Cloud rows are connected):
 
-**Stdio + dashboard env** is a different path (`ODOO_*` variables). Use HTTP + the pin URL for Desktop.
+```json
+{
+  "odoo-json2-dev": { "type": "http", "url": "https://odoo-json2.tylerjharden.dev/mcp/dev" },
+  "odoo-json2-test": { "type": "http", "url": "https://odoo-json2.tylerjharden.dev/mcp/test" },
+  "odoo-json2-prod": { "type": "http", "url": "https://odoo-json2.tylerjharden.dev/mcp/prod" }
+}
+```
+
+`/mcp` still works (existing pin). `/mcp/dev` rejects a Test/Prod token.
+
+**Stdio + dashboard env** is a different path. Use the HTTP pin for Desktop.
 
 ### 1. Host the MCP (required)
 
@@ -50,22 +56,21 @@ export ODOO_JSON2_STORE=/var/lib/odoo-json2/store.json
 node http.mjs   # or: docker build && run, PORT=8788
 ```
 
-Point DNS at that process. Edit `mcp.json` if the URL is not `https://odoo-json2.tylerjharden.dev/mcp`.
+Point DNS at that process. Plugin `mcp.json` uses `/mcp/dev`, `/mcp/test`, `/mcp/prod`.
 
-### 2. Install the plugin
+### 2. Install the plugin (0.3.1)
 
-- **Desktop:** symlink this repo to `~/.cursor/plugins/local/odoo-json2`, reload, enable the plugin.
-- **Same sheet as Notion for the team:** publish at [cursor.com/marketplace/publish](https://cursor.com/marketplace/publish) or add the repo to the IPP team marketplace (Dashboard → Plugins).
-- **Cloud Agents:** add a **Team HTTP MCP** (not stdio) with URL `https://odoo-json2.tylerjharden.dev/mcp`. Configure → Resource **Cloud** / **Cloud — ipp** → Connect (same single slot per surface).
+Copy or clone **into** `~/.cursor/plugins/local/odoo-json2` from this branch (no outbound symlink), or republish / refresh the marketplace listing. Reload Window.
 
-### 3. Connect one instance (Dev first)
+### 3. Get Local + Cloud + Cloud — ipp rows (Notion Environment list)
 
-On each Resource you care about (Local, then Cloud):
+Those names are Cursor resources, not Odoo envs. They appear only after each surface is connected:
 
-1. Toggle the plugin on.
-2. **Connect** / complete OAuth → choose **Dev** on our hosted form → paste Dev URL / database / API key.
-3. Configure stays **Local / Connected / Logout**. It will not list “Dev” or offer Add Another Account.
-4. Logout clears that slot. A later Test or Prod login **replaces** it unless Cursor later adds multi-account for third-party plugins.
+1. **Local** — already on Desktop after Connect on `odoo-json2-dev`.
+2. **Cloud** — Dashboard → Integrations & MCP → custom HTTP `https://odoo-json2.tylerjharden.dev/mcp/dev` (no env) **or** add the plugin to the team marketplace. Configure → Resource **Cloud** → toggle on → Connect (Dev form).
+3. **Cloud — ipp** — same URL on the IPP Cloud resource. Configure → Resource **Cloud — ipp** → toggle on → Connect.
+
+If **+ Add Another Account** appears after those rows (same host chrome as Notion), use it. Cursor docs do not list a plugin.json key that forces that button. If it is still missing, connect **odoo-json2-test** and **odoo-json2-prod** the same way (separate MCP URLs). Do not put Prod keys in Vercel env.
 
 IPP ladder: Dev until verified → Test after merge to `dev` → Prod after merge to `main`.
 
