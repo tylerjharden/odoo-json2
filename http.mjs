@@ -62,6 +62,19 @@ const BLOB_API = process.env.VERCEL_BLOB_API_URL || "https://vercel.com/api/blob
 const BLOB_API_VERSION = "12";
 const DEFAULT_BLOB_PATH = "odoo-json2-oauth-store.json";
 const DEFAULT_KV_KEY = "odoo-json2-oauth-store";
+const OAUTH_STORE_LOCK = createHash("sha256")
+  .update("odoo_json2:public.odoo_json2_oauth_store")
+  .digest()
+  .readBigInt64BE(0)
+  .toString();
+const OAUTH_STORE_DDL = `CREATE TABLE IF NOT EXISTS public.odoo_json2_oauth_store (
+  id integer PRIMARY KEY,
+  doc jsonb NOT NULL,
+  CHECK (id = 1)
+)`;
+const OAUTH_STORE_REVOKE = "REVOKE ALL ON TABLE public.odoo_json2_oauth_store FROM PUBLIC";
+const OAUTH_STORE_UPSERT =
+  "INSERT INTO public.odoo_json2_oauth_store (id, doc) VALUES (1, $1::jsonb) ON CONFLICT (id) DO UPDATE SET doc = EXCLUDED.doc";
 
 export function emptyStore() {
   return { clients: {}, codes: {}, tokens: {}, accounts: {} };
@@ -214,19 +227,150 @@ export function createKvJsonStore(options = {}) {
   };
 }
 
+function connectionSecrets(connectionString) {
+  const raw = String(connectionString ?? "");
+  const found = [];
+  if (raw) found.push(raw);
+  try {
+    const url = new URL(raw);
+    if (url.password) {
+      found.push(url.password);
+      try {
+        const decoded = decodeURIComponent(url.password);
+        if (decoded) found.push(decoded);
+      } catch {
+        found.push(url.password);
+      }
+    }
+    const scheme = raw.indexOf("://");
+    const at = raw.lastIndexOf("@");
+    if (scheme !== -1 && at > scheme) {
+      const userinfo = raw.slice(scheme + 3, at);
+      const colon = userinfo.indexOf(":");
+      if (colon !== -1 && userinfo.slice(colon + 1)) found.push(userinfo.slice(colon + 1));
+    }
+  } catch {
+    found.push(raw);
+  }
+  return [...new Set(found)].sort((a, b) => b.length - a.length);
+}
+
+function redactText(text, secrets) {
+  let out = String(text ?? "");
+  for (const secret of secrets) {
+    if (!secret) continue;
+    out = out.split(secret).join("[redacted]");
+  }
+  return out;
+}
+
+function redactError(err, connectionString) {
+  const secrets = connectionSecrets(connectionString);
+  const message = redactText(err instanceof Error ? err.message : err, secrets);
+  const stackSource = err instanceof Error && err.stack ? err.stack : message;
+  const redacted = new Error(message);
+  redacted.stack = redactText(stackSource, secrets);
+  if (err && typeof err === "object" && err.code) redacted.code = err.code;
+  return redacted;
+}
+
+export function createPostgresJsonStore({ connectionString }) {
+  let poolPromise = null;
+
+  function openPool() {
+    if (poolPromise) return poolPromise;
+    let pending;
+    pending = (async () => {
+      let pool;
+      try {
+        const { Pool } = await import("pg");
+        pool = new Pool({
+          connectionString,
+          max: 1,
+          allowExitOnIdle: true,
+        });
+        pool.on("error", (err) => {
+          log(redactError(err, connectionString));
+        });
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          try {
+            // Concurrent CREATE TABLE IF NOT EXISTS and REVOKE fail unless one transaction holds this lock.
+            await client.query("SELECT pg_advisory_xact_lock($1::bigint)", [OAUTH_STORE_LOCK]);
+            await client.query(OAUTH_STORE_DDL);
+            await client.query(OAUTH_STORE_REVOKE);
+            await client.query("COMMIT");
+          } catch (err) {
+            await client.query("ROLLBACK").catch(() => undefined);
+            throw err;
+          }
+        } finally {
+          client.release();
+        }
+        return pool;
+      } catch (err) {
+        if (pool) await pool.end().catch(() => undefined);
+        if (poolPromise === pending) poolPromise = null;
+        throw redactError(err, connectionString);
+      }
+    })();
+    poolPromise = pending;
+    return pending;
+  }
+
+  async function query(text, values) {
+    const pool = await openPool();
+    try {
+      return await pool.query(text, values);
+    } catch (err) {
+      throw redactError(err, connectionString);
+    }
+  }
+
+  return {
+    async read() {
+      const result = await query("SELECT doc FROM public.odoo_json2_oauth_store WHERE id = 1");
+      if (result.rowCount === 0) return emptyStore();
+      return normalizeStore(result.rows[0].doc);
+    },
+    async write(next) {
+      await query(OAUTH_STORE_UPSERT, [JSON.stringify(next)]);
+    },
+    async close() {
+      const pending = poolPromise;
+      poolPromise = null;
+      if (!pending) return;
+      const pool = await pending.catch(() => null);
+      if (pool) await pool.end().catch(() => undefined);
+    },
+  };
+}
+
+export function selectStoreBackend(env = process.env) {
+  if (env.BLOB_READ_WRITE_TOKEN) return "blob";
+  if (env.KV_REST_API_URL && env.KV_REST_API_TOKEN) return "kv";
+  if (env.DATABASE_URL) return "postgres";
+  return "file";
+}
+
 export function createRuntimeStore(env = process.env) {
-  if (env.BLOB_READ_WRITE_TOKEN) {
+  const backend = selectStoreBackend(env);
+  if (backend === "blob") {
     return createBlobJsonStore({
       token: env.BLOB_READ_WRITE_TOKEN,
       pathname: env.ODOO_JSON2_BLOB_PATH || DEFAULT_BLOB_PATH,
     });
   }
-  if (env.KV_REST_API_URL && env.KV_REST_API_TOKEN) {
+  if (backend === "kv") {
     return createKvJsonStore({
       url: env.KV_REST_API_URL,
       token: env.KV_REST_API_TOKEN,
       key: env.ODOO_JSON2_KV_KEY || DEFAULT_KV_KEY,
     });
+  }
+  if (backend === "postgres") {
+    return createPostgresJsonStore({ connectionString: env.DATABASE_URL });
   }
   return createFileStore(env.ODOO_JSON2_STORE || resolve("data/store.json"));
 }

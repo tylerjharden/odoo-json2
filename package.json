@@ -21,5 +21,8 @@
     "test": "node test.mjs",
     "start": "node server.mjs",
     "start:http": "node http.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
   }
 }
