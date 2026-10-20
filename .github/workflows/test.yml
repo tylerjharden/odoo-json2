@@ -1,0 +1,43 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+      - run: npm test
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_DB: odoo_json2
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d odoo_json2"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ODOO_JSON2_TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/odoo_json2
+      ODOO_JSON2_REQUIRE_POSTGRES: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: test -n "$ODOO_JSON2_TEST_DATABASE_URL"
+      - run: npm ci
+      - run: npm test
