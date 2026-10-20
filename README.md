@@ -20,7 +20,7 @@ The `odoo-json2` skill documents `search`, `search_read`, `read`, `create`, `wri
 ## Requirements
 
 - Cursor IDE (desktop). **Grok Bot cannot load `~/.cursor/plugins/local`.** Grok Bot plugins are account-wide marketplace connectors, not this local folder.
-- Node.js 18 or newer (global `fetch`, no npm dependencies).
+- Node.js 18 or newer (global `fetch`). The JSON file store needs no packages. Postgres needs `pg` from `npm install`.
 - An Odoo 19 database on a **Custom** pricing plan (the external API is not available on One App Free or Standard).
 - A user API key.
 
@@ -157,7 +157,30 @@ npm run check   # node --check server.mjs
 npm test        # stdio initialize + tools/list; mocked odoo_call (no live Odoo)
 ```
 
-Tests never use a real API key or a public Odoo instance.
+Tests never use a real API key or a public Odoo instance. Postgres cases run only when `ODOO_JSON2_TEST_DATABASE_URL` is set.
+
+## Self-hosting
+
+No database is required. The default store is a JSON file at `ODOO_JSON2_STORE`, or `data/store.json` when that variable is unset. Vercel Blob and Postgres are optional. KV remains in the precedence list.
+
+The server picks a store in this order.
+
+1. `BLOB_READ_WRITE_TOKEN` uses Vercel Blob.
+2. `KV_REST_API_URL` and `KV_REST_API_TOKEN` together use KV.
+3. `DATABASE_URL` uses Postgres.
+4. Otherwise the server uses the JSON file.
+
+An empty string is unset. Values are not trimmed. When `BLOB_READ_WRITE_TOKEN` is set, the server uses Blob even if `DATABASE_URL` is set. When both KV variables are set, the server uses KV even if `DATABASE_URL` is set. One KV variable plus `DATABASE_URL` selects Postgres.
+
+Moving the hosted Vercel deployment is out of scope. `vercel.json` stays as it is. A host that already sets `BLOB_READ_WRITE_TOKEN` keeps Blob until that token is unset.
+
+### Postgres (Neon recommended)
+
+Use Neon as the Postgres host. The Neon free plan can hold this store. Give the Dev, Test, and Prod Odoo environments their own Neon branches.
+
+Set `DATABASE_URL` to a Postgres connection string. This server opens that string with the `pg` package. The connection string guide is [Connect from any application](https://neon.com/docs/connect/connect-from-any-app.md). The branching guide is [Branching](https://neon.com/docs/introduction/branching.md). [Neon serverless driver](https://neon.com/docs/serverless/serverless-driver.md) describes `@neondatabase/serverless`. The driver in this server is `pg`.
+
+The image runs `npm ci --omit=dev` and installs `pg`. An unset `DATABASE_URL` still selects the JSON file.
 
 ## Layout
 
