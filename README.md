@@ -172,7 +172,7 @@ The server picks a store in this order.
 
 An empty string is unset. Values are not trimmed. When `BLOB_READ_WRITE_TOKEN` is set, the server uses Blob even if `DATABASE_URL` is set. When both KV variables are set, the server uses KV even if `DATABASE_URL` is set. One KV variable plus `DATABASE_URL` selects Postgres.
 
-The hosted Vercel build runs `npm ci --omit=dev`, which installs `pg`. A host that sets `BLOB_READ_WRITE_TOKEN` keeps Blob until that token is unset.
+The hosted Vercel function install runs `npm install`, which installs `pg`. A host that sets `BLOB_READ_WRITE_TOKEN` keeps Blob until that token is unset.
 
 ### Postgres (Neon recommended)
 
