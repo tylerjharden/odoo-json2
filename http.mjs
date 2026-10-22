@@ -36,6 +36,13 @@ const CURSOR_REDIRECTS = [
   "cursor://anysphere.cursor-mcp/oauth/callback",
 ];
 
+const NOTION_REDIRECTS = [
+  "https://app.notion.com/workflows/mcp/oauth/callback",
+  "https://www.notion.so/workflows/mcp/oauth/callback",
+];
+
+const OAUTH_SCOPES = ["default", "odoo", "mcp"];
+
 function log(...args) {
   process.stderr.write(
     args.map((a) => (typeof a === "string" ? a : a instanceof Error ? a.stack || a.message : JSON.stringify(a))).join(" ") +
@@ -291,14 +298,22 @@ export function lockedAccountFromAuthorizeQuery(query = {}) {
 
 function isAllowedRedirect(uri, registered = []) {
   if (!uri) return false;
-  if (CURSOR_REDIRECTS.includes(uri)) return true;
+  if (CURSOR_REDIRECTS.includes(uri) || NOTION_REDIRECTS.includes(uri)) return true;
   if (registered.includes(uri)) return true;
   try {
     const url = new URL(uri);
+    if (url.username || url.password || url.protocol !== "http:") return false;
     return url.hostname === "localhost" || url.hostname === "127.0.0.1";
   } catch {
     return false;
   }
+}
+
+function grantedScope(raw) {
+  const known = String(raw || "")
+    .split(/\s+/)
+    .filter((scope) => OAUTH_SCOPES.includes(scope));
+  return known.length ? known.join(" ") : "odoo";
 }
 
 function json(res, status, body, extraHeaders = {}) {
@@ -309,6 +324,7 @@ function json(res, status, body, extraHeaders = {}) {
     "access-control-allow-origin": "*",
     "access-control-allow-headers": "Authorization, Content-Type, Mcp-Session-Id, Accept",
     "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
+    "access-control-expose-headers": "WWW-Authenticate, Mcp-Session-Id",
     ...extraHeaders,
   });
   res.end(raw);
@@ -326,12 +342,12 @@ function text(res, status, body, contentType = "text/plain; charset=utf-8") {
 function unauthorized(res, origin, suffix = "") {
   const metadata = suffix
     ? `${origin}/.well-known/oauth-protected-resource/mcp/${suffix}`
-    : `${origin}/.well-known/oauth-protected-resource`;
+    : `${origin}/.well-known/oauth-protected-resource/mcp`;
   json(
     res,
     401,
-    { error: "invalid_token", error_description: "Connect from the plugin Configure sheet (Environment Local → Connect)." },
-    { "www-authenticate": `Bearer realm="odoo-json2", resource_metadata="${metadata}"` }
+    { error: "invalid_token", error_description: "Sign in with OAuth, then send the access token as a Bearer token." },
+    { "www-authenticate": `Bearer realm="odoo-json2", error="invalid_token", resource_metadata="${metadata}"` }
   );
 }
 
@@ -358,7 +374,7 @@ export function authorizationServerMetadata(origin) {
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
-    scopes_supported: ["default", "odoo"],
+    scopes_supported: OAUTH_SCOPES,
   };
 }
 
@@ -367,7 +383,7 @@ export function protectedResourceMetadata(origin, suffix = "") {
     resource: mcpResource(origin, suffix),
     authorization_servers: [origin],
     bearer_methods_supported: ["header"],
-    scopes_supported: ["default", "odoo"],
+    scopes_supported: OAUTH_SCOPES,
     resource_name: suffix ? `odoo-json2 ${suffix}` : "odoo-json2 MCP",
   };
 }
@@ -398,7 +414,7 @@ function authorizePage({ origin, query, error, locked = "" }) {
   .hint { color: #555; font-size: 13px; }
 </style></head><body>
 <h1>Connect an Odoo account</h1>
-<p>Connect this Cursor surface (Local, Cloud, or Cloud — ipp). Named Dev / Test / Prod slots are the <code>/mcp/dev</code>, <code>/mcp/test</code>, and <code>/mcp/prod</code> MCP URLs.</p>
+<p>Sign in to connect this MCP client. Named Dev / Test / Prod slots are the <code>/mcp/dev</code>, <code>/mcp/test</code>, and <code>/mcp/prod</code> URLs. <code>/mcp</code> asks you to choose an account.</p>
 ${err}
 <form method="post" action="/oauth/authorize?${escapeHtml(q)}">
   ${accountSelect}
@@ -458,6 +474,7 @@ export function createHttpHandler(options = {}) {
           "access-control-allow-origin": "*",
           "access-control-allow-headers": "Authorization, Content-Type, Mcp-Session-Id, Accept",
           "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
+          "access-control-expose-headers": "WWW-Authenticate, Mcp-Session-Id",
         });
         res.end();
         return;
@@ -483,22 +500,24 @@ export function createHttpHandler(options = {}) {
           json(res, 400, { error: "invalid_client_metadata" });
           return;
         }
-        const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris.filter((u) => isAllowedRedirect(u)) : [];
-        if (!redirectUris.length) {
-          json(res, 400, { error: "invalid_redirect_uri", error_description: "Register a Cursor or localhost redirect URI." });
+        const redirectUris = Array.isArray(body.redirect_uris) ? body.redirect_uris.filter((u) => typeof u === "string") : [];
+        if (!redirectUris.length || redirectUris.some((u) => !isAllowedRedirect(u))) {
+          json(res, 400, { error: "invalid_redirect_uri", error_description: "Redirect URI is not an allowed MCP client callback." });
           return;
         }
         const clientId = token();
+        const clientName = typeof body.client_name === "string" && body.client_name ? body.client_name : "mcp";
         await mutate(store, (data) => {
           data.clients[clientId] = {
             client_id: clientId,
             redirect_uris: redirectUris,
             token_endpoint_auth_method: "none",
-            client_name: body.client_name || "cursor",
+            client_name: clientName,
           };
         });
         json(res, 201, {
           client_id: clientId,
+          client_name: clientName,
           redirect_uris: redirectUris,
           token_endpoint_auth_method: "none",
           grant_types: ["authorization_code", "refresh_token"],
@@ -575,11 +594,13 @@ export function createHttpHandler(options = {}) {
             redirectUri,
             challenge,
             accountId,
+            scope: grantedScope(params.scope),
             exp: Date.now() + CODE_TTL_MS,
           };
         });
         const next = new URL(redirectUri);
         next.searchParams.set("code", code);
+        next.searchParams.set("iss", origin);
         if (state) next.searchParams.set("state", state);
         res.writeHead(302, { location: next.toString(), "cache-control": "no-store" });
         res.end();
@@ -600,15 +621,15 @@ export function createHttpHandler(options = {}) {
           const refresh = token();
           await mutate(store, (data) => {
             delete data.codes[form.code];
-            data.tokens[access] = { kind: "access", accountId: row.accountId, exp: Date.now() + ACCESS_TTL_MS };
-            data.tokens[refresh] = { kind: "refresh", accountId: row.accountId, exp: Date.now() + REFRESH_TTL_MS };
+            data.tokens[access] = { kind: "access", accountId: row.accountId, exp: Date.now() + ACCESS_TTL_MS, scope: row.scope || "odoo" };
+            data.tokens[refresh] = { kind: "refresh", accountId: row.accountId, exp: Date.now() + REFRESH_TTL_MS, scope: row.scope || "odoo" };
           });
           json(res, 200, {
             access_token: access,
             refresh_token: refresh,
             token_type: "bearer",
             expires_in: Math.floor(ACCESS_TTL_MS / 1000),
-            scope: "odoo",
+            scope: row.scope || "odoo",
           });
           return;
         }
@@ -620,14 +641,14 @@ export function createHttpHandler(options = {}) {
           }
           const access = token();
           await mutate(store, (data) => {
-            data.tokens[access] = { kind: "access", accountId: row.accountId, exp: Date.now() + ACCESS_TTL_MS };
+            data.tokens[access] = { kind: "access", accountId: row.accountId, exp: Date.now() + ACCESS_TTL_MS, scope: row.scope || "odoo" };
           });
           json(res, 200, {
             access_token: access,
             refresh_token: form.refresh_token,
             token_type: "bearer",
             expires_in: Math.floor(ACCESS_TTL_MS / 1000),
-            scope: "odoo",
+            scope: row.scope || "odoo",
           });
           return;
         }
