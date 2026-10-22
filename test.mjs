@@ -4,9 +4,9 @@
  * Does not contact a real Odoo and does not use a live API key.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, symlinkSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,17 +29,21 @@ import {
   startHttp,
   createMemoryStore,
   createBlobJsonStore,
+  createKvJsonStore,
   createRuntimeStore,
   createFileStore,
   parseBlobStoreId,
   selectStoreBackend,
   createPostgresJsonStore,
   emptyStore,
+  OAUTH_MAPS,
+  STORE_KINDS,
   authorizationServerMetadata,
   protectedResourceMetadata,
   parseMcpPath,
   lockedAccountFromAuthorizeQuery,
 } from "./http.mjs";
+import { runStoreCli } from "./store-cli.mjs";
 
 const realFetch = globalThis.fetch.bind(globalThis);
 
@@ -727,6 +731,10 @@ await checkAsync("HTTP OAuth connect Dev then call odoo_version on that account"
       ["odoo_call", "odoo_version"]
     );
     assert.equal(listed.result.tools[0].inputSchema.properties.environment, undefined);
+    assert.deepEqual(
+      Object.keys(store.read()),
+      OAUTH_MAPS.map((map) => map.name)
+    );
   } finally {
     await http.close();
   }
@@ -963,6 +971,16 @@ function mockBlobFetch() {
   return { token, storeId, fetchImpl, files };
 }
 
+function mockKvFetch() {
+  const values = new Map();
+  const fetchImpl = async (_url, init) => {
+    const [command, key, value] = JSON.parse(init.body);
+    if (command === "SET") values.set(key, value);
+    return mockResponse(200, { result: command === "GET" ? values.get(key) ?? null : "OK" });
+  };
+  return { values, fetchImpl };
+}
+
 await checkAsync("durable Blob store survives a second isolate with the same bearer", async () => {
   const blob = mockBlobFetch();
   assert.equal(parseBlobStoreId(blob.token), blob.storeId);
@@ -1099,6 +1117,92 @@ check("createRuntimeStore follows selectStoreBackend for blob, postgres, and fil
   assert.equal(file.read().clients.y, 1);
 });
 
+check("each store kind's default secret variables select that kind", () => {
+  for (const [name, kind] of Object.entries(STORE_KINDS)) {
+    const env = Object.fromEntries(
+      Object.values(kind.slots)
+        .filter((slot) => slot.secret)
+        .map((slot) => [slot.env, "set"])
+    );
+    assert.equal(selectStoreBackend(env), name);
+  }
+});
+
+await checkAsync("store load tells a missing document from a stored one", async () => {
+  const doc = sampleOAuthDocument();
+  const dir = join(tmpdir(), `odoo-json2-load-${process.pid}`);
+  rmSync(dir, { recursive: true, force: true });
+  const path = join(dir, "store.json");
+  const file = createFileStore(path);
+  assert.deepEqual(file.load(), { found: false });
+  assert.deepEqual(file.read(), emptyStore());
+  file.write(doc);
+  assert.deepEqual(file.load(), { found: true, text: JSON.stringify(doc) });
+  writeFileSync(path, "{not json");
+  assert.deepEqual(file.load(), { found: true, text: "{not json" });
+  assert.deepEqual(file.read(), emptyStore());
+
+  const blob = mockBlobFetch();
+  const blobStore = createBlobJsonStore({ token: blob.token, fetchImpl: blob.fetchImpl });
+  assert.deepEqual(await blobStore.load(), { found: false });
+  assert.deepEqual(await blobStore.read(), emptyStore());
+  await blobStore.write(doc);
+  assert.deepEqual(await blobStore.load(), { found: true, text: JSON.stringify(doc) });
+  assert.deepEqual(await blobStore.read(), doc);
+
+  const kv = mockKvFetch();
+  const kvStore = createKvJsonStore({ url: "https://kv.example", token: "kv-token", fetchImpl: kv.fetchImpl });
+  assert.deepEqual(await kvStore.load(), { found: false });
+  assert.deepEqual(await kvStore.read(), emptyStore());
+  await kvStore.write(doc);
+  assert.deepEqual(await kvStore.load(), { found: true, text: JSON.stringify(doc) });
+  assert.deepEqual(await kvStore.read(), doc);
+
+  assert.deepEqual(createMemoryStore(null).load(), { found: false });
+  assert.deepEqual(createMemoryStore(doc).load(), { found: true, text: JSON.stringify(doc) });
+});
+
+check("file store creates its directory on write and replaces the file with mode 0600", () => {
+  const dir = join(tmpdir(), `odoo-json2-write-${process.pid}`);
+  rmSync(dir, { recursive: true, force: true });
+  const path = join(dir, "nested", "store.json");
+  const store = createFileStore(path);
+  assert.equal(existsSync(dir), false);
+  store.write(emptyStore());
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+  chmodSync(path, 0o644);
+  store.write(sampleOAuthDocument());
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+  assert.deepEqual(readdirSync(join(dir, "nested")), ["store.json"]);
+  assert.deepEqual(store.read(), sampleOAuthDocument());
+});
+
+await checkAsync("blob and kv stores never fall back to ambient credentials", async () => {
+  const names = ["BLOB_READ_WRITE_TOKEN", "KV_REST_API_URL", "KV_REST_API_TOKEN"];
+  const saved = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  const blob = mockBlobFetch();
+  process.env.BLOB_READ_WRITE_TOKEN = blob.token;
+  process.env.KV_REST_API_URL = "https://ambient-kv.example";
+  process.env.KV_REST_API_TOKEN = "ambient-kv-token";
+  try {
+    await assert.rejects(createBlobJsonStore({ fetchImpl: blob.fetchImpl }).load(), /store id missing/);
+    const sent = [];
+    const kvStore = createKvJsonStore({
+      fetchImpl: async (url, init) => {
+        sent.push([url, init.headers.authorization]);
+        return mockResponse(200, { result: null });
+      },
+    });
+    await kvStore.load();
+    assert.deepEqual(sent, [["", "Bearer "]]);
+  } finally {
+    for (const name of names) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name];
+    }
+  }
+});
+
 function sampleOAuthDocument() {
   return {
     clients: {
@@ -1129,6 +1233,319 @@ function sampleOAuthDocument() {
     },
   };
 }
+
+const STORE_NOW = Date.parse("2026-10-22T00:00:00Z");
+const STORE_DATABASE_URL = "postgres://odoo:pw-9f3a@db.test/odoo";
+const BLOB_TO_POSTGRES = ["--from", "blob:token=LEGACY_BLOB_TOKEN", "--to", "postgres"];
+const BLOB_PATH = "odoo-json2-oauth-store.json";
+
+function storeFixture() {
+  const doc = sampleOAuthDocument();
+  doc.codes["raw-code-key"] = {
+    clientId: "client-1",
+    redirectUri: "http://localhost:8787/callback",
+    challenge: "challenge",
+    accountId: "dev",
+    exp: STORE_NOW + 60_000,
+  };
+  doc.tokens["raw-token-key"] = { kind: "refresh", accountId: "dev", exp: STORE_NOW + 3_600_000 };
+  doc.tokens["expired-token-key"] = { kind: "access", accountId: "dev", exp: STORE_NOW - 1 };
+  return doc;
+}
+
+async function seedBlob(blob, doc) {
+  await createBlobJsonStore({ token: blob.token, storeId: blob.storeId, fetchImpl: blob.fetchImpl }).write(doc);
+}
+
+function sortedKeys(_key, value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  return Object.fromEntries(Object.entries(value).sort(([a], [b]) => (a < b ? -1 : 1)));
+}
+
+// jsonb reorders object keys, so the stand-in hands back sorted keys.
+function postgresStandIn(initial = null) {
+  let text = initial === null || typeof initial === "string" ? initial : JSON.stringify(initial, sortedKeys);
+  const pg = {
+    writes: 0,
+    load: async () => (text === null ? { found: false } : { found: true, text }),
+    write: async (doc) => {
+      pg.writes += 1;
+      text = JSON.stringify(doc, sortedKeys);
+    },
+    doc: () => JSON.parse(text),
+  };
+  return pg;
+}
+
+function storeIo({ blob, pg, prompt = null }) {
+  const lines = [];
+  const opened = [];
+  let blobPuts = 0;
+  const fetchImpl = (url, init = {}) => {
+    if (init.method === "PUT") blobPuts += 1;
+    return blob.fetchImpl(url, init);
+  };
+  const io = {
+    env: { LEGACY_BLOB_TOKEN: blob.token, DATABASE_URL: STORE_DATABASE_URL },
+    kinds: {
+      ...STORE_KINDS,
+      blob: {
+        ...STORE_KINDS.blob,
+        open: (config) => {
+          opened.push(["blob", config.token]);
+          return createBlobJsonStore({ token: config.token, pathname: config.path, storeId: blob.storeId, fetchImpl });
+        },
+      },
+      postgres: {
+        ...STORE_KINDS.postgres,
+        open: (config) => {
+          opened.push(["postgres", config.url]);
+          return pg;
+        },
+      },
+    },
+    now: () => STORE_NOW,
+    out: (line) => lines.push(line),
+    err: (line) => lines.push(line),
+    prompt,
+  };
+  return { io, lines, opened, blobPuts: () => blobPuts };
+}
+
+function scriptedPrompt(answers) {
+  const asked = [];
+  return {
+    asked,
+    ask: async (question) => {
+      asked.push(question);
+      if (!answers.length) throw new Error("unexpected prompt");
+      return answers.shift();
+    },
+    close() {},
+  };
+}
+
+function assertNoStoreSecrets(lines, blob) {
+  const text = lines.join("\n");
+  for (const secret of [blob.token, STORE_DATABASE_URL, "pw-9f3a", "secret-key", "raw-token-key", "raw-code-key", "expired-token-key"]) {
+    assert.equal(text.includes(secret), false, "store output holds a fixture secret");
+  }
+}
+
+function assertCopied(written) {
+  const fixture = storeFixture();
+  assert.deepEqual(written.clients, fixture.clients);
+  assert.deepEqual(written.accounts, fixture.accounts);
+  assert.deepEqual(written.tokens, { "raw-token-key": fixture.tokens["raw-token-key"] });
+  assert.deepEqual(written.codes, {});
+}
+
+await checkAsync("store sync copies Blob into Postgres and a second run changes nothing", async () => {
+  const blob = mockBlobFetch();
+  await seedBlob(blob, storeFixture());
+  const pg = postgresStandIn();
+  const { io, lines, opened } = storeIo({ blob, pg });
+  const argv = ["sync", ...BLOB_TO_POSTGRES, "--apply"];
+  assert.equal(await runStoreCli(argv, io), 0);
+  assert.deepEqual(opened, [
+    ["blob", blob.token],
+    ["postgres", STORE_DATABASE_URL],
+  ]);
+  assertCopied(pg.doc());
+  assert.equal(pg.writes, 1);
+  const tokenLabel = `#${createHash("sha256").update("raw-token-key").digest("hex").slice(0, 8)}`;
+  assert.ok(lines.some((line) => line.startsWith(`+ tokens/${tokenLabel}`)));
+  assert.equal(await runStoreCli(argv, io), 0);
+  assert.equal(pg.writes, 1);
+  assert.equal(lines.at(-1), "Nothing to change.");
+  assertNoStoreSecrets(lines, blob);
+});
+
+await checkAsync("store sync copies Postgres into Blob and a second run changes nothing", async () => {
+  const blob = mockBlobFetch();
+  const pg = postgresStandIn(storeFixture());
+  const { io, lines, blobPuts } = storeIo({ blob, pg });
+  const argv = ["sync", "--from", "postgres", "--to", "blob:token=LEGACY_BLOB_TOKEN", "--apply"];
+  assert.equal(await runStoreCli(argv, io), 0);
+  assertCopied(JSON.parse(blob.files.get(BLOB_PATH)));
+  assert.equal(blobPuts(), 1);
+  assert.equal(await runStoreCli(argv, io), 0);
+  assert.equal(blobPuts(), 1);
+  assert.equal(pg.writes, 0);
+  assert.equal(lines.at(-1), "Nothing to change.");
+  assertNoStoreSecrets(lines, blob);
+});
+
+await checkAsync("store sync writes a differing client only with --prefer", async () => {
+  const blob = mockBlobFetch();
+  await seedBlob(blob, storeFixture());
+  const renamed = { ...storeFixture().clients["client-1"], client_name: "renamed" };
+  const pg = postgresStandIn({ ...emptyStore(), clients: { "client-1": renamed } });
+  const { io, lines } = storeIo({ blob, pg });
+  assert.equal(await runStoreCli(["sync", ...BLOB_TO_POSTGRES, "--apply"], io), 2);
+  assert.equal(pg.writes, 0);
+  assert.ok(lines.some((line) => line.startsWith("! clients/client-1") && line.includes("client_name")));
+  assert.equal(await runStoreCli(["sync", ...BLOB_TO_POSTGRES, "--apply", "--prefer", "target"], io), 0);
+  assert.deepEqual(pg.doc().clients["client-1"], renamed);
+  assert.deepEqual(pg.doc().accounts, storeFixture().accounts);
+  assert.equal(await runStoreCli(["sync", ...BLOB_TO_POSTGRES, "--apply", "--prefer", "source"], io), 0);
+  assert.deepEqual(pg.doc().clients["client-1"], storeFixture().clients["client-1"]);
+});
+
+await checkAsync("store migrate refuses a target that holds a record and fills an empty one", async () => {
+  const blob = mockBlobFetch();
+  await seedBlob(blob, storeFixture());
+  const held = postgresStandIn({ ...emptyStore(), tokens: { "old-token": { kind: "access", accountId: "x", exp: 1 } } });
+  assert.equal(await runStoreCli(["migrate", ...BLOB_TO_POSTGRES, "--apply"], storeIo({ blob, pg: held }).io), 2);
+  assert.equal(held.writes, 0);
+  const empty = postgresStandIn();
+  assert.equal(await runStoreCli(["migrate", ...BLOB_TO_POSTGRES, "--apply"], storeIo({ blob, pg: empty }).io), 0);
+  assertCopied(empty.doc());
+});
+
+await checkAsync("store refuses an absent or corrupt source and a corrupt target without writing", async () => {
+  const blob = mockBlobFetch();
+  const pg = postgresStandIn();
+  const { io, lines } = storeIo({ blob, pg });
+  const argv = ["sync", ...BLOB_TO_POSTGRES, "--apply"];
+  assert.equal(await runStoreCli(argv, io), 2);
+  blob.files.set(BLOB_PATH, '{"raw-code-key": x}');
+  assert.equal(await runStoreCli(argv, io), 2);
+  blob.files.set(BLOB_PATH, JSON.stringify({ ...emptyStore(), clients: ["client-1"] }));
+  assert.equal(await runStoreCli(argv, io), 2);
+  assert.equal(pg.writes, 0);
+  await seedBlob(blob, storeFixture());
+  const corruptTarget = postgresStandIn("{not json");
+  assert.equal(await runStoreCli(argv, storeIo({ blob, pg: corruptTarget }).io), 2);
+  assert.equal(corruptTarget.writes, 0);
+  assert.equal(lines.join("\n").includes("raw-code-key"), false);
+});
+
+await checkAsync("store refuses --since, missing flags off a terminal, and one store on both sides", async () => {
+  const blob = mockBlobFetch();
+  await seedBlob(blob, storeFixture());
+  const pg = postgresStandIn();
+  const { io, lines, opened } = storeIo({ blob, pg });
+  assert.equal(await runStoreCli(["sync", ...BLOB_TO_POSTGRES, "--apply", "--since", "2026-10-01T00:00:00Z"], io), 2);
+  assert.equal(await runStoreCli(["sync", "--from", "blob:token=LEGACY_BLOB_TOKEN", "--apply"], io), 2);
+  assert.match(lines.at(-1), /--to/);
+  assert.equal(await runStoreCli(["sync", "--from", "postgres", "--to", "postgres", "--apply"], io), 2);
+  assert.deepEqual(opened, []);
+  assert.equal(pg.writes, 0);
+  const bin = spawnSync(process.execPath, [join(root, "bin", "odoo-json2.mjs"), "store", "sync", "--from", "file"], {
+    cwd: tmpdir(),
+    encoding: "utf8",
+    input: "",
+  });
+  assert.equal(bin.status, 2);
+  assert.match(bin.stderr, /--to/);
+});
+
+await checkAsync("store blocks a record Postgres cannot hold and copies the rest", async () => {
+  const blob = mockBlobFetch();
+  const doc = storeFixture();
+  doc.clients["client-nul"] = { ...doc.clients["client-1"], client_id: "client-nul", client_name: "bad\u0000name" };
+  doc.accounts["field-nul"] = { ...doc.accounts.dev, id: "field-nul", "note\u0000": "x" };
+  await seedBlob(blob, doc);
+  const pg = postgresStandIn();
+  const { io, lines } = storeIo({ blob, pg });
+  assert.equal(await runStoreCli(["sync", ...BLOB_TO_POSTGRES, "--apply"], io), 0);
+  assertCopied(pg.doc());
+  assert.ok(lines.some((line) => line.startsWith("x clients/client-nul")));
+  assert.ok(lines.some((line) => line.startsWith("x accounts/field-nul")));
+  assert.equal(lines.join("\n").includes("\u0000"), false);
+});
+
+await checkAsync("store writes nothing when the target changes after the preview", async () => {
+  const blob = mockBlobFetch();
+  await seedBlob(blob, storeFixture());
+  const serverClient = { ...storeFixture().clients["client-1"], client_name: "written by the server" };
+  const loads = [{ found: false }, { found: true, text: JSON.stringify({ ...emptyStore(), clients: { "client-1": serverClient } }) }];
+  const pg = {
+    writes: 0,
+    load: async () => loads.shift(),
+    write: async () => {
+      pg.writes += 1;
+    },
+  };
+  assert.equal(await runStoreCli(["sync", ...BLOB_TO_POSTGRES, "--apply"], storeIo({ blob, pg }).io), 1);
+  assert.equal(pg.writes, 0);
+});
+
+await checkAsync("store names each record the target did not keep", async () => {
+  const blob = mockBlobFetch();
+  await seedBlob(blob, storeFixture());
+  const pg = postgresStandIn();
+  const write = pg.write;
+  pg.write = (doc) => write({ ...doc, accounts: {} });
+  const { io, lines } = storeIo({ blob, pg });
+  assert.equal(await runStoreCli(["sync", ...BLOB_TO_POSTGRES, "--apply"], io), 1);
+  assert.ok(lines.includes("Not verified: accounts/dev"));
+  assert.match(lines.at(-1), /Verified 2 of 3\.$/);
+});
+
+await checkAsync("store hides document secrets when a write error echoes the document", async () => {
+  const blob = mockBlobFetch();
+  await seedBlob(blob, storeFixture());
+  const pg = postgresStandIn();
+  pg.write = async (doc) => {
+    throw new Error(`invalid input syntax for type json. JSON data: ${JSON.stringify(doc)}`);
+  };
+  const { io, lines } = storeIo({ blob, pg });
+  assert.equal(await runStoreCli(["sync", ...BLOB_TO_POSTGRES, "--apply"], io), 1);
+  assert.match(lines.at(-1), /invalid input syntax/);
+  assertNoStoreSecrets(lines, blob);
+});
+
+await checkAsync("store asks for missing flags on a terminal and writes only after yes", async () => {
+  const blob = mockBlobFetch();
+  await seedBlob(blob, storeFixture());
+  const pg = postgresStandIn();
+  const argv = ["sync", "--from", "blob:token=LEGACY_BLOB_TOKEN"];
+  const declined = scriptedPrompt(["postgres", "", "n"]);
+  assert.equal(await runStoreCli(argv, storeIo({ blob, pg, prompt: declined }).io), 0);
+  assert.equal(pg.writes, 0);
+  assert.ok(declined.asked.some((question) => question.includes("[DATABASE_URL, set]")));
+  assert.equal(declined.asked.join("\n").includes("pw-9f3a"), false);
+  const accepted = scriptedPrompt(["postgres", "", "y"]);
+  assert.equal(await runStoreCli(argv, storeIo({ blob, pg, prompt: accepted }).io), 0);
+  assertCopied(pg.doc());
+  const untouched = postgresStandIn();
+  const complete = scriptedPrompt([]);
+  assert.equal(await runStoreCli(["sync", ...BLOB_TO_POSTGRES], storeIo({ blob, pg: untouched, prompt: complete }).io), 0);
+  assert.deepEqual(complete.asked, []);
+  assert.equal(untouched.writes, 0);
+});
+
+await checkAsync("store asks which side wins a differing record on a terminal", async () => {
+  const blob = mockBlobFetch();
+  await seedBlob(blob, storeFixture());
+  const renamed = { ...storeFixture().clients["client-1"], client_name: "renamed" };
+  const argv = ["sync", "--from", "blob:token=LEGACY_BLOB_TOKEN"];
+  const aborted = postgresStandIn({ ...emptyStore(), clients: { "client-1": renamed } });
+  assert.equal(await runStoreCli(argv, storeIo({ blob, pg: aborted, prompt: scriptedPrompt(["postgres", "", ""]) }).io), 2);
+  assert.equal(aborted.writes, 0);
+  const keptTarget = postgresStandIn({ ...emptyStore(), clients: { "client-1": renamed } });
+  assert.equal(await runStoreCli(argv, storeIo({ blob, pg: keptTarget, prompt: scriptedPrompt(["postgres", "", "t", "y"]) }).io), 0);
+  assert.deepEqual(keptTarget.doc().clients["client-1"], renamed);
+  const keptSource = postgresStandIn({ ...emptyStore(), clients: { "client-1": renamed } });
+  assert.equal(await runStoreCli(argv, storeIo({ blob, pg: keptSource, prompt: scriptedPrompt(["postgres", "", "s", "y"]) }).io), 0);
+  assert.deepEqual(keptSource.doc().clients["client-1"], storeFixture().clients["client-1"]);
+});
+
+await checkAsync("store refuses a pasted secret in a spec without printing it", async () => {
+  const blob = mockBlobFetch();
+  const { io, lines, opened } = storeIo({ blob, pg: postgresStandIn() });
+  assert.equal(await runStoreCli(["sync", "--from", "blob:token=vercel_blob_rw_pasted_9f3a7c", "--to", "postgres"], io), 2);
+  assert.equal(lines.at(-1), "blob token= names a variable that is not set.");
+  const pastedUrl = "postgres:url=postgres://odoo:pasted-pw@db.test/odoo";
+  assert.equal(await runStoreCli(["sync", "--from", "blob:token=LEGACY_BLOB_TOKEN", "--to", pastedUrl], io), 2);
+  assert.equal(lines.at(-1), "postgres url= takes the name of an environment variable, not its value.");
+  assert.deepEqual(opened, []);
+  const text = lines.join("\n");
+  assert.equal(text.includes("pasted_9f3a7c"), false);
+  assert.equal(text.includes("pasted-pw"), false);
+});
 
 await checkAsync("refused postgres connection hides the password", async () => {
   await import("pg");
@@ -1190,6 +1607,25 @@ if (!postgresTestUrl) {
     } finally {
       await admin.end().catch(() => undefined);
       await Promise.all(stores.map((store) => store.close()));
+    }
+  });
+
+  await checkAsync("postgres load reports a missing row, then the stored document", async () => {
+    const { Client } = await import("pg");
+    const admin = new Client({ connectionString: postgresTestUrl });
+    const store = createPostgresJsonStore({ connectionString: postgresTestUrl });
+    try {
+      await admin.connect();
+      await admin.query("DROP TABLE IF EXISTS public.odoo_json2_oauth_store");
+      assert.deepEqual(await store.load(), { found: false });
+      assert.deepEqual(await store.read(), emptyStore());
+      await store.write(sampleOAuthDocument());
+      const loaded = await store.load();
+      assert.equal(loaded.found, true);
+      assert.deepEqual(JSON.parse(loaded.text), sampleOAuthDocument());
+    } finally {
+      await store.close();
+      await admin.end().catch(() => undefined);
     }
   });
 

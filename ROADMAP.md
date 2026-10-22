@@ -29,3 +29,7 @@ Planned, not shipped. Write a self-hosted Odoo on Neon guide only after that set
 ## A PIM platform
 
 Planned, not shipped. Later work can grow this server into a PIM platform.
+
+## Per-record change times in the OAuth store
+
+Planned, not shipped. Record when each OAuth record last changed, so `odoo-json2 store sync --since TIME` can copy only the records that changed after that time. No store kind records a change time today, so `--since` exits 2 and `sync` compares every record.
