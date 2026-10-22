@@ -1,8 +1,4 @@
 #!/usr/bin/env node
-/**
- * npm/npx bin. `store` copies OAuth records between stores. --http starts the
- * remote OAuth MCP. Default is stdio (single-instance local / Cloud Agent fallback).
- */
 import { startStdio } from "../server.mjs";
 import { startHttp, createRuntimeStore } from "../http.mjs";
 import { runStoreCli } from "../store-cli.mjs";

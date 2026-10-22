@@ -76,20 +76,17 @@ const OAUTH_STORE_REVOKE = "REVOKE ALL ON TABLE public.odoo_json2_oauth_store FR
 const OAUTH_STORE_UPSERT =
   "INSERT INTO public.odoo_json2_oauth_store (id, doc) VALUES (1, $1::jsonb) ON CONFLICT (id) DO UPDATE SET doc = EXCLUDED.doc";
 
-// removedBy is when the server deletes a record, and copies between stores trust it. A record the
-// server never deletes was never in a store that lacks it. A code may already be exchanged, so it
-// never copies. If the server starts revoking tokens, tokens become "use".
 export const OAUTH_MAPS = Object.freeze([
-  { name: "clients", removedBy: "never", secretKey: false, secretFields: [], printed: ["client_name"] },
-  { name: "codes", removedBy: "use", secretKey: true, secretFields: [], printed: [] },
-  { name: "tokens", removedBy: "expiry", secretKey: true, secretFields: [], printed: ["kind", "accountId"] },
-  { name: "accounts", removedBy: "never", secretKey: false, secretFields: ["apiKey"], printed: ["name"] },
+  { name: "clients", copies: "always", secretKey: false, secretFields: [], printed: ["client_name"] },
+  { name: "codes", copies: "never", secretKey: true, secretFields: [], printed: [] },
+  { name: "tokens", copies: "unexpired", secretKey: true, secretFields: [], printed: ["kind", "accountId"] },
+  { name: "accounts", copies: "always", secretKey: false, secretFields: ["apiKey"], printed: ["name"] },
 ]);
 
 for (const row of OAUTH_MAPS) {
   const complete =
     typeof row.name === "string" &&
-    ["never", "expiry", "use"].includes(row.removedBy) &&
+    ["always", "unexpired", "never"].includes(row.copies) &&
     typeof row.secretKey === "boolean" &&
     Array.isArray(row.secretFields) &&
     Array.isArray(row.printed);

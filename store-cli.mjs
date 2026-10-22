@@ -1,8 +1,3 @@
-/**
- * odoo-json2 store migrate|sync. Copies OAuth clients, tokens, and connected
- * accounts from one store kind to another. It never removes a target record.
- */
-
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline/promises";
 import { isDeepStrictEqual, parseArgs } from "node:util";
@@ -245,14 +240,14 @@ function resolveEndpoint({ kind, overrides }, env, kinds) {
   const secrets = [];
   for (const [slot, def] of Object.entries(kinds[kind].slots)) {
     if (def.secret) {
-      const name = overrides[slot] ?? def.env;
-      // A pasted secret can look like a variable name, so only the default name is echoed.
-      if (!env[name]) {
-        refuse(overrides[slot] ? `${kind} ${slot}= names a variable that is not set.` : `${name} is not set. Set it, or pass ${kind}:${slot}=VAR.`);
+      const typedName = overrides[slot];
+      const envName = typedName ?? def.env;
+      if (!env[envName]) {
+        refuse(typedName ? `${kind} ${slot}= names a variable that is not set.` : `${envName} is not set. Set it, or pass ${kind}:${slot}=VAR.`);
       }
-      config[slot] = env[name];
-      shown.push(`${slot}=${name}`);
-      secrets.push(...connectionSecrets(env[name]));
+      config[slot] = env[envName];
+      shown.push(`${slot}=${envName}`);
+      secrets.push(...connectionSecrets(env[envName]));
     } else {
       config[slot] = overrides[slot] ?? (env[def.env] || def.fallback);
       shown.push(`${slot}=${config[slot]}`);
@@ -319,8 +314,8 @@ function planTransfer(source, target, policy) {
 }
 
 function decide(map, key, value, existing, { prefer, now, refuses }) {
-  if (map.removedBy === "use") return { action: "skip", why: map.name };
-  if (map.removedBy === "expiry" && value.exp < now) return { action: "skip", why: `expired ${map.name}` };
+  if (map.copies === "never") return { action: "skip", why: map.name };
+  if (map.copies === "unexpired" && value.exp < now) return { action: "skip", why: `expired ${map.name}` };
   const fields = existing ? differingFields(existing, value) : [];
   if (existing && !fields.length) return { action: "same" };
   if (existing && prefer !== "source") return { action: prefer === "target" ? "keep" : "conflict", fields };
@@ -373,8 +368,8 @@ function renderPlan(plan, source, target, sourceDoc, targetDoc) {
     if (!mark) continue;
     const record = sourceDoc[change.map][change.key];
     const printed = OAUTH_MAPS.find((map) => map.name === change.map).printed;
-    const shown = printed.map((field) => printable(record[field])).filter(Boolean).join(" ");
-    const detail = change.fields ? `differs in ${change.fields.map(printable).join(", ")}` : change.why;
+    const shown = printed.map((field) => stripTerminalControls(record[field])).filter(Boolean).join(" ");
+    const detail = change.fields ? `differs in ${change.fields.map(stripTerminalControls).join(", ")}` : change.why;
     lines.push([`${mark} ${change.map}/${change.label}`, shown, detail].filter(Boolean).join("  "));
   }
   const parts = Object.entries(tally).map(([action, n]) =>
@@ -401,11 +396,10 @@ function docSecrets(doc) {
 }
 
 function labelFor(map, key) {
-  return map.secretKey ? `#${createHash("sha256").update(key).digest("hex").slice(0, 8)}` : printable(key);
+  return map.secretKey ? `#${createHash("sha256").update(key).digest("hex").slice(0, 8)}` : stripTerminalControls(key);
 }
 
-// client_name comes from unauthenticated registration, so a document string can carry terminal escapes.
-function printable(text) {
+function stripTerminalControls(text) {
   return String(text ?? "")
     .replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
     .slice(0, 60);
