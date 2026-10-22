@@ -182,6 +182,105 @@ Set `DATABASE_URL` to a Postgres connection string. This server opens that strin
 
 The image runs `npm ci --omit=dev` and installs `pg`. An unset `DATABASE_URL` still selects the JSON file.
 
+## Move the OAuth store
+
+`odoo-json2 store` copies OAuth clients, unexpired tokens, and connected accounts from one store to another. It works between any two of Blob, KV, Postgres, and the JSON file. From a checkout, run it as `node bin/odoo-json2.mjs store`.
+
+```
+node bin/odoo-json2.mjs store migrate --from SPEC --to SPEC [--apply]
+node bin/odoo-json2.mjs store sync    --from SPEC --to SPEC [--apply] [--prefer source|target]
+```
+
+A SPEC names a store kind. It can also say where each setting comes from. A setting you leave out comes from the variable the server reads.
+
+| SPEC | Defaults |
+| --- | --- |
+| `blob[:token=VAR,path=VALUE,api=VALUE]` | `token` reads `BLOB_READ_WRITE_TOKEN`. `path` reads `ODOO_JSON2_BLOB_PATH`, else `odoo-json2-oauth-store.json`. `api` reads `VERCEL_BLOB_API_URL`, else `https://vercel.com/api/blob`. |
+| `kv[:url=VAR,token=VAR,key=VALUE]` | `url` reads `KV_REST_API_URL`. `token` reads `KV_REST_API_TOKEN`. `key` reads `ODOO_JSON2_KV_KEY`, else `odoo-json2-oauth-store`. |
+| `postgres[:url=VAR]` | `url` reads `DATABASE_URL`. |
+| `file[:path=VALUE]` | `path` reads `ODOO_JSON2_STORE`, else `data/store.json`. |
+
+`token=` and `url=` take the name of an environment variable, not its value. The CLI refuses anything that is not a variable name, so a pasted secret stops the run and never prints. `path=`, `api=`, and `key=` take the value itself.
+
+### What a run copies
+
+- `migrate` fills an empty store. It refuses a target that holds any record.
+- `sync` adds what the target lacks. A second run prints `Nothing to change.` and writes nothing.
+- Neither command removes a target record, copies an authorization code, or copies an expired token. The server deletes a code when a client exchanges it, so a stored code may already be spent.
+- If both stores hold different values for one record, `sync` writes nothing until you pass `--prefer source` or `--prefer target`.
+- Postgres cannot store a NUL character. A record that holds one stays out, and the other records still copy.
+- `--since` exits 2. No store kind records when each record changed, so `sync` compares every record.
+
+The preview marks each record that changes. `+` adds, `~` updates, `=` keeps the target's value, `!` differs and needs `--prefer`, and `x` is blocked. Code and token keys are secrets, so they print as `#` and the first 8 hex digits of their SHA-256. The output never holds a connection string, a password, a store token, or an account API key.
+
+The CLI writes nothing until you pass `--apply` or answer `y` at the prompt. Before it writes, it reads the target again. If the target changed since the preview, it writes nothing and exits 1. After the write, it reads the target back and checks every record it wrote.
+
+On a terminal, the CLI asks for the command, `--from`, or `--to` when one is missing. It then shows the preview, asks which side wins a record that differs, and asks before it writes. A command line that names all three never prompts. Off a terminal, a missing value exits 2.
+
+```
+$ node bin/odoo-json2.mjs store
+Command (migrate, sync): sync
+Source kind (blob, kv, postgres, file): blob
+  blob token variable [BLOB_READ_WRITE_TOKEN, unset]: LEGACY_BLOB_TOKEN
+  blob path [odoo-json2-oauth-store.json]:
+  blob api [https://vercel.com/api/blob]:
+Target kind (blob, kv, postgres, file): postgres
+  postgres url variable [DATABASE_URL, set]:
+```
+
+The exit status is 0 when the write verified, when the run was a dry run, when you declined the write, or when nothing changed. It is 1 when a read or a write fails, when a record does not verify, or when the target changed after the preview. It is 2 when the CLI refuses before it writes.
+
+### Import a Blob document into Postgres
+
+1. Read the Blob token into the shell. `read -rs` keeps the value off the screen and out of shell history.
+
+   ```bash
+   read -rs LEGACY_BLOB_TOKEN && export LEGACY_BLOB_TOKEN
+   ```
+
+2. Read the Postgres connection string into `DATABASE_URL` the same way.
+
+   ```bash
+   read -rs DATABASE_URL && export DATABASE_URL
+   ```
+
+3. Preview the copy.
+
+   ```bash
+   node bin/odoo-json2.mjs store sync --from blob:token=LEGACY_BLOB_TOKEN --to postgres
+   ```
+
+   ```
+   sync blob (token=LEGACY_BLOB_TOKEN, path=odoo-json2-oauth-store.json, api=https://vercel.com/api/blob) to postgres (url=DATABASE_URL)
+   source 9 records, target 1 record
+   x clients/COdNSbxl2-3y  cursor  postgres cannot store a NUL character
+   + clients/D_fpsyY_77bZ  cursor
+   + clients/WwW6ZnvfyCi4  cursor
+   + tokens/#3fdd37d3  access 2c7tSIGcV4Qh
+   + tokens/#d3866233  refresh 2c7tSIGcV4Qh
+   + accounts/2c7tSIGcV4Qh  dev
+   + accounts/5bbrWMD7b2h4  test
+   add 6  update 0  keep 0  conflict 0  blocked 1  same 0  skip 2 (codes 1, expired tokens 1)  target only 1
+   Dry run. Nothing written. Pass --apply to write 6 records.
+   ```
+
+4. Run the same command with `--apply`. The run ends with `Wrote 6 records to postgres (url=DATABASE_URL). Verified 6 of 6.`
+5. Run the `--apply` command again. It ends with `Nothing to change.`
+
+### Keep a rollback copy in Blob
+
+```bash
+node bin/odoo-json2.mjs store sync --from postgres --to blob:token=LEGACY_BLOB_TOKEN --apply
+```
+
+If a record differs between the two stores, add `--prefer source` to keep the Postgres value.
+
+### Move a self-hosted file store into Postgres
+
+```bash
+node bin/odoo-json2.mjs store migrate --from file:path=/var/lib/odoo-json2/store.json --to postgres --apply
+```
+
 ## Layout
 
 ```
