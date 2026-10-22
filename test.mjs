@@ -40,6 +40,14 @@ import {
   parseMcpPath,
   lockedAccountFromAuthorizeQuery,
 } from "./http.mjs";
+import {
+  NEON_BRANCH_PROD,
+  NEON_BRANCH_SHARED_DEV,
+  assertPreviewStore,
+  normalizeNeonHost,
+  removePreviewPr,
+} from "./preview-store.mjs";
+import { runPreviewWorkflow } from "./scripts/preview-branch.mjs";
 
 const realFetch = globalThis.fetch.bind(globalThis);
 
@@ -1093,6 +1101,281 @@ if (!postgresTestUrl) {
     }
   });
 }
+
+const previewPassword = "pw-preview-9f3a";
+const previewDatabaseUrl = `postgres://odoo:${previewPassword}@ep-pr-pooler.c-3.us-east-1.aws.neon.tech/neondb`;
+
+function previewGuardEnv(overrides = {}) {
+  return {
+    VERCEL_ENV: "preview",
+    VERCEL_GIT_PULL_REQUEST_ID: "12",
+    DATABASE_URL: previewDatabaseUrl,
+    NEON_BRANCH_ID: "br-preview-branch",
+    NEON_ENDPOINT_HOST: "ep-pr.c-3.us-east-1.aws.neon.tech",
+    NEON_PREVIEW_DENY_HOSTS: "ep-prod.us-east-1.aws.neon.tech, ep-dev-pooler.us-east-1.aws.neon.tech",
+    ...overrides,
+  };
+}
+
+function refusesPreview(env, secret) {
+  let error = null;
+  try {
+    assertPreviewStore(env, selectStoreBackend(env));
+  } catch (err) {
+    error = err;
+  }
+  assert.ok(error, "preview guard should refuse this env");
+  assert.equal(error.message.includes(secret), false);
+  assert.equal(error.message.includes(previewPassword), false);
+  return error;
+}
+
+check("preview store refuses blob, production, shared dev, and a mismatched host", () => {
+  const blob = refusesPreview(previewGuardEnv({ BLOB_READ_WRITE_TOKEN: "vercel_blob_rw_store_secret_token" }), "vercel_blob_rw_store_secret_token");
+  assert.match(blob.message, /refuses the blob store/);
+  assert.match(refusesPreview(previewGuardEnv({ NEON_BRANCH_ID: NEON_BRANCH_PROD })).message, /production or the shared dev/);
+  assert.match(refusesPreview(previewGuardEnv({ NEON_BRANCH_ID: NEON_BRANCH_SHARED_DEV })).message, /production or the shared dev/);
+  assert.match(refusesPreview(previewGuardEnv({ NEON_BRANCH_ID: "" })).message, /NEON_BRANCH_ID/);
+  assert.match(refusesPreview(previewGuardEnv({ NEON_ENDPOINT_HOST: "ep-other.us-east-1.aws.neon.tech" })).message, /does not match/);
+  assert.match(refusesPreview(previewGuardEnv({ NEON_PREVIEW_DENY_HOSTS: "" })).message, /NEON_PREVIEW_DENY_HOSTS/);
+  assert.match(
+    refusesPreview(previewGuardEnv({
+      DATABASE_URL: `postgres://odoo:${previewPassword}@ep-prod-pooler.us-east-1.aws.neon.tech/neondb`,
+      NEON_ENDPOINT_HOST: "ep-prod.us-east-1.aws.neon.tech",
+    })).message,
+    /not allowed/,
+  );
+  assert.equal(normalizeNeonHost("ep-pr-pooler.c-3.us-east-1.aws.neon.tech"), "ep-pr.c-3.us-east-1.aws.neon.tech");
+});
+
+await checkAsync("preview store accepts its own Neon branch", async () => {
+  assertPreviewStore(previewGuardEnv(), "postgres");
+  const store = createRuntimeStore(previewGuardEnv());
+  assert.equal(typeof store.read, "function");
+  await store.close();
+});
+
+check("a non-preview process does not apply the preview guard", () => {
+  assertPreviewStore({ BLOB_READ_WRITE_TOKEN: "blob-token", DATABASE_URL: previewDatabaseUrl }, "blob");
+});
+
+await checkAsync("preview oauth records carry previewPr and a second sweep removes nothing", async () => {
+  const store = createMemoryStore();
+  store.write({
+    clients: { keeper: { client_id: "keeper", client_name: "kept", redirect_uris: ["http://localhost:8787/callback"] } },
+    codes: {},
+    tokens: {},
+    accounts: { other: { id: "other", name: "dev", previewPr: 99, apiKey: "other-key" } },
+  });
+  const http = await startHttp({
+    store,
+    port: 0,
+    env: { VERCEL_ENV: "preview", VERCEL_GIT_PULL_REQUEST_ID: "12" },
+  });
+  const base = `http://127.0.0.1:${http.port}`;
+  try {
+    const registered = await (
+      await realFetch(`${base}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          client_name: "preview-client",
+          redirect_uris: ["http://localhost:8787/callback"],
+        }),
+      })
+    ).json();
+    const { verifier, challenge } = pkce();
+    const authorizeUrl = `${base}/oauth/authorize?response_type=code&client_id=${registered.client_id}&redirect_uri=${encodeURIComponent("http://localhost:8787/callback")}&code_challenge=${challenge}&code_challenge_method=S256&state=s1`;
+    const posted = await realFetch(authorizeUrl, {
+      method: "POST",
+      redirect: "manual",
+      body: new URLSearchParams({ account: "dev", url: "https://dev.example.com", database: "dev-db", api_key: "dev-key" }),
+    });
+    assert.equal(posted.status, 302);
+    const code = new URL(posted.headers.get("location")).searchParams.get("code");
+    const tokenBody = await (
+      await realFetch(`${base}/oauth/token`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "authorization_code",
+          code,
+          client_id: registered.client_id,
+          redirect_uri: "http://localhost:8787/callback",
+          code_verifier: verifier,
+        }),
+      })
+    ).json();
+    assert.ok(tokenBody.access_token);
+    const doc = store.read();
+    assert.equal(doc.clients.keeper.previewPr, undefined);
+    assert.equal(doc.clients[registered.client_id].previewPr, 12);
+    assert.equal(doc.accounts.other.previewPr, 99);
+    assert.equal(Object.values(doc.accounts).find((account) => account.previewPr === 12).name, "dev");
+    assert.equal(Object.values(doc.tokens).every((row) => row.previewPr === 12), true);
+    assert.equal(Object.keys(doc.codes).length, 0);
+    const first = removePreviewPr(doc, 12);
+    assert.equal(first.counts.clients, 1);
+    assert.equal(first.counts.accounts, 1);
+    assert.equal(first.counts.tokens, 2);
+    assert.equal(first.doc.clients.keeper.client_name, "kept");
+    assert.equal(first.doc.accounts.other.apiKey, "other-key");
+    const second = removePreviewPr(first.doc, 12);
+    assert.deepEqual(second.counts, { clients: 0, codes: 0, tokens: 0, accounts: 0 });
+    assert.deepEqual(second.doc, first.doc);
+  } finally {
+    await http.close();
+  }
+});
+
+await checkAsync("preview branch workflow creates once, updates env in place, and sweeps twice", async () => {
+  const password = "neon-uri-password";
+  const uri = `postgres://neondb_owner:${password}@ep-pr-pooler.c-3.us-east-1.aws.neon.tech/neondb`;
+  const devPassword = "dev-sweep-password";
+  const logs = [];
+  const calls = [];
+  let branches = [];
+  let endpoints = [];
+  let doc = {
+    clients: {
+      keeper: { client_id: "keeper", client_name: "kept" },
+      preview: { client_id: "preview", client_name: "preview", previewPr: 12 },
+    },
+    codes: {},
+    tokens: { leaked: { kind: "access", accountId: "a", previewPr: 12, exp: 1 } },
+    accounts: { kept: { id: "kept", name: "dev", apiKey: "keep-me" } },
+  };
+  const vercelEnv = [
+    { id: "env_prod", key: "DATABASE_URL", target: ["production"], gitBranch: null, value: "postgres://prod:prod-secret@ep-prod.neon.tech/neondb" },
+    { id: "env_shared", key: "DATABASE_URL", target: ["preview"], value: "postgres://dev:dev-secret@ep-dev.neon.tech/neondb" },
+  ];
+  const fetchImpl = async (url, options = {}) => {
+    const href = String(url);
+    calls.push({ href, method: options.method || "GET", body: options.body });
+    if ((href.includes("/branches?") || href.endsWith("/branches")) && (options.method || "GET") === "GET") {
+      return Response.json({ branches });
+    }
+    if (href.endsWith("/branches") && options.method === "POST") {
+      const branch = { id: "br-new-preview", name: "preview-pr-12" };
+      branches = [branch];
+      endpoints = [{ host: "ep-pr.c-3.us-east-1.aws.neon.tech" }];
+      return Response.json({ branch, endpoints });
+    }
+    if (href.includes("/endpoints") && (options.method || "GET") === "GET") return Response.json({ endpoints });
+    if (href.includes("/connection_uri")) return Response.json({ uri });
+    if (href.includes("/branches/br-new-preview") && options.method === "DELETE") {
+      branches = [];
+      return new Response(null, { status: 204 });
+    }
+    if (href.includes("api.vercel.com") && href.includes("/env") && (options.method || "GET") === "GET") {
+      return Response.json({ envs: vercelEnv });
+    }
+    if (href.includes("api.vercel.com") && options.method === "POST") {
+      const body = JSON.parse(options.body);
+      const id = `env_${body.key}_${vercelEnv.length}`;
+      vercelEnv.push({ id, key: body.key, target: body.target, gitBranch: body.gitBranch, value: body.value });
+      return Response.json({ created: { id, key: body.key }, failed: [] });
+    }
+    if (href.includes("api.vercel.com") && options.method === "PATCH") {
+      const id = href.match(/env\/([^?]+)/)[1];
+      const body = JSON.parse(options.body);
+      const row = vercelEnv.find((item) => item.id === id);
+      row.value = body.value;
+      return Response.json({ id });
+    }
+    if (href.includes("api.vercel.com") && options.method === "DELETE") {
+      const id = href.match(/env\/([^?]+)/)[1];
+      const index = vercelEnv.findIndex((item) => item.id === id);
+      if (index >= 0) vercelEnv.splice(index, 1);
+      return new Response(null, { status: 204 });
+    }
+    if (href.includes("api.github.com")) return Response.json([{ number: 12 }]);
+    return new Response("missing", { status: 404 });
+  };
+  class FakeClient {
+    static constructed = 0;
+    constructor() {
+      FakeClient.constructed += 1;
+    }
+    async connect() {}
+    async query(sql, params) {
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [] };
+      if (sql.startsWith("SELECT")) return { rows: [{ doc }] };
+      if (sql.startsWith("UPDATE")) {
+        doc = JSON.parse(params[0]);
+        return { rows: [] };
+      }
+      throw new Error(`unexpected sql ${sql}`);
+    }
+    async end() {}
+  }
+  const baseEnv = {
+    GITHUB_EVENT_NAME: "pull_request",
+    GITHUB_EVENT_ACTION: "opened",
+    PR_NUMBER: "12",
+    GIT_BRANCH: "feature",
+    NEON_API_KEY: "neon-api-key-value",
+    NEON_PROJECT_ID: "winter-band-75532409",
+    VERCEL_TOKEN: "vercel-token-value",
+    VERCEL_PROJECT_ID: "prj_vcK99a0k92xwEYbM4UGe5UalPRj9",
+    VERCEL_TEAM_ID: "team_YTsILlqZoAGHvfyNyI7ddIX3",
+    NEON_DEV_DATABASE_URL: `postgres://neondb_owner:${devPassword}@ep-dev-pooler.neon.tech/neondb`,
+  };
+  const first = await runPreviewWorkflow(baseEnv, { fetch: fetchImpl, pg: { Client: FakeClient }, log: (line) => logs.push(line) });
+  assert.equal(first.branchId, "br-new-preview");
+  const createdBranch = JSON.parse(calls.find((call) => call.method === "POST" && call.href.endsWith("/branches")).body);
+  assert.equal(createdBranch.branch.parent_id, NEON_BRANCH_SHARED_DEV);
+  assert.equal(createdBranch.branch.name, "preview-pr-12");
+  assert.equal(FakeClient.constructed, 0);
+  assert.equal(calls.some((call) => call.href.includes("/connection_uri") && call.href.includes("pooled=true")), true);
+  assert.equal(vercelEnv.find((item) => item.id === "env_prod").value.includes("prod-secret"), true);
+  assert.equal(vercelEnv.find((item) => item.id === "env_shared").value.includes("dev-secret"), true);
+  const branchDatabase = vercelEnv.find((item) => item.key === "DATABASE_URL" && item.gitBranch === "feature");
+  assert.equal(branchDatabase.value, uri);
+  assert.equal(branchDatabase.target.length, 1);
+  const createdIds = vercelEnv.filter((item) => item.gitBranch === "feature").map((item) => item.id);
+  calls.length = 0;
+  await runPreviewWorkflow({ ...baseEnv, GITHUB_EVENT_ACTION: "synchronize" }, { fetch: fetchImpl, pg: { Client: FakeClient }, log: (line) => logs.push(line) });
+  assert.equal(calls.filter((call) => call.method === "POST" && call.href.endsWith("/branches")).length, 0);
+  assert.equal(FakeClient.constructed, 0);
+  const patched = calls.filter((call) => call.method === "PATCH").map((call) => call.href);
+  assert.equal(patched.length, 3);
+  assert.equal(patched.some((href) => href.includes("env_prod") || href.includes("env_shared")), false);
+  for (const id of createdIds) assert.equal(patched.some((href) => href.includes(id)), true);
+  calls.length = 0;
+  const removed = await runPreviewWorkflow(
+    { ...baseEnv, GITHUB_EVENT_NAME: "delete", GITHUB_EVENT_ACTION: "", GITHUB_REF_TYPE: "branch", PR_NUMBER: "", GIT_BRANCH: "refs/heads/feature", GITHUB_TOKEN: "github-token-value", GITHUB_REPOSITORY: "tylerjharden/odoo-json2" },
+    { fetch: fetchImpl, pg: { Client: FakeClient }, log: (line) => logs.push(line) },
+  );
+  assert.equal(removed.counts.clients, 1);
+  assert.equal(removed.counts.tokens, 1);
+  assert.equal(doc.clients.keeper.client_name, "kept");
+  assert.equal(doc.accounts.kept.apiKey, "keep-me");
+  assert.equal(vercelEnv.some((item) => item.gitBranch === "feature"), false);
+  assert.equal(vercelEnv.some((item) => item.id === "env_prod"), true);
+  const again = await runPreviewWorkflow(
+    { ...baseEnv, GITHUB_EVENT_NAME: "pull_request", GITHUB_EVENT_ACTION: "closed" },
+    { fetch: fetchImpl, pg: { Client: FakeClient }, log: (line) => logs.push(line) },
+  );
+  assert.equal(again.counts.clients, 0);
+  assert.equal(logs.join("\n").includes(password), false);
+  assert.equal(logs.join("\n").includes(devPassword), false);
+  assert.equal(logs.join("\n").includes("neon-api-key-value"), false);
+  assert.equal(logs.join("\n").includes(uri), false);
+  let hidden = null;
+  try {
+    await runPreviewWorkflow(baseEnv, {
+      fetch: async () => new Response(`leaked ${password} ${uri}`, { status: 500 }),
+      pg: { Client: FakeClient },
+      log: (line) => logs.push(line),
+    });
+  } catch (err) {
+    hidden = err;
+  }
+  assert.ok(hidden);
+  assert.equal(hidden.message.includes(password), false);
+  assert.equal(hidden.message.includes(uri), false);
+});
 
 process.stderr.write(`\n${passed} passed, ${failed} failed\n`);
 if (failed) process.exit(1);

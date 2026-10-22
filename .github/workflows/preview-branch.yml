@@ -1,0 +1,44 @@
+name: preview branch
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+  delete:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: preview-branch-${{ github.event.pull_request.number || github.event.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preview-branch:
+    if: (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'delete' && github.event.ref_type == 'branch')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: npm ci
+      - name: Ensure or remove the Neon preview branch
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_EVENT_ACTION: ${{ github.event.action }}
+          GITHUB_REF_TYPE: ${{ github.event.ref_type }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GIT_BRANCH: ${{ github.event.pull_request.head.ref || github.event.ref }}
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+          NEON_PARENT_BRANCH_ID: ${{ secrets.NEON_PARENT_BRANCH_ID }}
+          NEON_DEV_DATABASE_URL: ${{ secrets.NEON_DEV_DATABASE_URL }}
+          NEON_DATABASE_NAME: neondb
+          NEON_ROLE_NAME: neondb_owner
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_PROJECT_ID: prj_vcK99a0k92xwEYbM4UGe5UalPRj9
+          VERCEL_TEAM_ID: team_YTsILlqZoAGHvfyNyI7ddIX3
+        run: node scripts/preview-branch.mjs

@@ -24,6 +24,7 @@ import {
   normalizeEnvironmentName,
   displayEnvironmentName,
 } from "./server.mjs";
+import { assertPreviewStore, withPreviewStamp } from "./preview-store.mjs";
 
 const ACCESS_TTL_MS = 8 * 60 * 60 * 1000;
 const REFRESH_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -356,6 +357,7 @@ export function selectStoreBackend(env = process.env) {
 
 export function createRuntimeStore(env = process.env) {
   const backend = selectStoreBackend(env);
+  assertPreviewStore(env, backend);
   if (backend === "blob") {
     return createBlobJsonStore({
       token: env.BLOB_READ_WRITE_TOKEN,
@@ -590,7 +592,8 @@ async function lookupAccount(store, accessToken) {
 
 export function createHttpHandler(options = {}) {
   const store = options.store || createMemoryStore();
-  const fallbackOrigin = (options.publicUrl || process.env.ODOO_JSON2_PUBLIC_URL || "").replace(/\/$/, "");
+  const env = options.env ?? process.env;
+  const fallbackOrigin = (options.publicUrl || env.ODOO_JSON2_PUBLIC_URL || "").replace(/\/$/, "");
 
   return async (req, res) => {
     try {
@@ -634,12 +637,12 @@ export function createHttpHandler(options = {}) {
         }
         const clientId = token();
         await mutate(store, (data) => {
-          data.clients[clientId] = {
+          data.clients[clientId] = withPreviewStamp({
             client_id: clientId,
             redirect_uris: redirectUris,
             token_endpoint_auth_method: "none",
             client_name: body.client_name || "cursor",
-          };
+          }, env);
         });
         json(res, 201, {
           client_id: clientId,
@@ -702,7 +705,7 @@ export function createHttpHandler(options = {}) {
         const accountId = token();
         const code = token();
         await mutate(store, (data) => {
-          data.accounts[accountId] = {
+          data.accounts[accountId] = withPreviewStamp({
             id: accountId,
             name: accountName,
             label: displayEnvironmentName(accountName),
@@ -713,14 +716,14 @@ export function createHttpHandler(options = {}) {
             keyVar: "connected account API key",
             dbVar: "connected account database",
             production: isProductionEnvironment(accountName),
-          };
-          data.codes[code] = {
+          }, env);
+          data.codes[code] = withPreviewStamp({
             clientId,
             redirectUri,
             challenge,
             accountId,
             exp: Date.now() + CODE_TTL_MS,
-          };
+          }, env);
         });
         const next = new URL(redirectUri);
         next.searchParams.set("code", code);
@@ -744,8 +747,8 @@ export function createHttpHandler(options = {}) {
           const refresh = token();
           await mutate(store, (data) => {
             delete data.codes[form.code];
-            data.tokens[access] = { kind: "access", accountId: row.accountId, exp: Date.now() + ACCESS_TTL_MS };
-            data.tokens[refresh] = { kind: "refresh", accountId: row.accountId, exp: Date.now() + REFRESH_TTL_MS };
+            data.tokens[access] = withPreviewStamp({ kind: "access", accountId: row.accountId, exp: Date.now() + ACCESS_TTL_MS }, env);
+            data.tokens[refresh] = withPreviewStamp({ kind: "refresh", accountId: row.accountId, exp: Date.now() + REFRESH_TTL_MS }, env);
           });
           json(res, 200, {
             access_token: access,
@@ -764,7 +767,7 @@ export function createHttpHandler(options = {}) {
           }
           const access = token();
           await mutate(store, (data) => {
-            data.tokens[access] = { kind: "access", accountId: row.accountId, exp: Date.now() + ACCESS_TTL_MS };
+            data.tokens[access] = withPreviewStamp({ kind: "access", accountId: row.accountId, exp: Date.now() + ACCESS_TTL_MS }, env);
           });
           json(res, 200, {
             access_token: access,
