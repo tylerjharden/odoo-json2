@@ -101,11 +101,12 @@ export async function ensurePreviewBranch({ env, fetchImpl, pr, gitBranch, secre
   const uri = connection.uri || connection.connection_uri;
   if (!uri || !uri.includes("://")) throw new Error("Neon connection URI response had no uri.");
   secrets.push(uri, passwordFromUrl(uri));
-  await setBranchEnv(env, fetchImpl, gitBranch, [
+  const createdEnv = await setBranchEnv(env, fetchImpl, gitBranch, [
     { key: "DATABASE_URL", value: uri, type: "sensitive" },
     { key: "NEON_BRANCH_ID", value: branch.id, type: "plain" },
     { key: "NEON_ENDPOINT_HOST", value: endpointHost, type: "plain" },
   ], secrets);
+  if (createdEnv) await deployPreview(env, fetchImpl, gitBranch, secrets);
   return { branchId: branch.id, branchName: name, endpointHost };
 }
 
@@ -195,6 +196,7 @@ async function findBranch(env, fetchImpl, name, secrets) {
 
 async function setBranchEnv(env, fetchImpl, gitBranch, rows, secrets) {
   const existing = await listProjectEnv(env, fetchImpl, secrets);
+  let created = false;
   for (const row of rows) {
     const matches = existing.filter((item) => isPreviewBranchEnv(item, row.key, gitBranch));
     if (matches.length > 1) throw new Error(`More than one preview ${row.key} exists for this git branch.`);
@@ -204,12 +206,30 @@ async function setBranchEnv(env, fetchImpl, gitBranch, rows, secrets) {
         body: { value: row.value, type: row.type, target: ["preview"], gitBranch },
       }, secrets);
     } else {
+      created = true;
       await vercel(env, fetchImpl, `/v10/projects/${env.VERCEL_PROJECT_ID}/env`, {
         method: "POST",
         body: { key: row.key, value: row.value, type: row.type, target: ["preview"], gitBranch },
       }, secrets);
     }
   }
+  return created;
+}
+
+async function deployPreview(env, fetchImpl, gitBranch, secrets) {
+  requireSecret(env, "GITHUB_REPOSITORY");
+  const [org, repo] = env.GITHUB_REPOSITORY.split("/");
+  if (!org || !repo) throw new Error("GITHUB_REPOSITORY is missing.");
+  const project = await vercel(env, fetchImpl, `/v9/projects/${env.VERCEL_PROJECT_ID}`, {}, secrets);
+  if (!project.name) throw new Error("Vercel project has no name.");
+  await vercel(env, fetchImpl, "/v13/deployments?forceNew=1&skipAutoDetectionConfirmation=1", {
+    method: "POST",
+    body: {
+      name: project.name,
+      project: env.VERCEL_PROJECT_ID,
+      gitSource: { type: "github", org, repo, ref: gitBranch },
+    },
+  }, secrets);
 }
 
 async function deleteBranchEnv({ env, fetchImpl, gitBranch, secrets }) {

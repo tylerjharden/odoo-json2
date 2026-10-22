@@ -1267,6 +1267,12 @@ await checkAsync("preview branch workflow creates once, updates env in place, an
       branches = [];
       return new Response(null, { status: 204 });
     }
+    if (href.includes("api.vercel.com") && href.includes("/v13/deployments") && options.method === "POST") {
+      return Response.json({ id: "dpl_preview", readyState: "QUEUED" });
+    }
+    if (href.includes("api.vercel.com") && href.includes("/v9/projects/") && !href.includes("/env") && (options.method || "GET") === "GET") {
+      return Response.json({ id: "prj_vcK99a0k92xwEYbM4UGe5UalPRj9", name: "odoo-json2" });
+    }
     if (href.includes("api.vercel.com") && href.includes("/env") && (options.method || "GET") === "GET") {
       return Response.json({ envs: vercelEnv });
     }
@@ -1319,6 +1325,7 @@ await checkAsync("preview branch workflow creates once, updates env in place, an
     VERCEL_TOKEN: "vercel-token-value",
     VERCEL_PROJECT_ID: "prj_vcK99a0k92xwEYbM4UGe5UalPRj9",
     VERCEL_TEAM_ID: "team_YTsILlqZoAGHvfyNyI7ddIX3",
+    GITHUB_REPOSITORY: "tylerjharden/odoo-json2",
     NEON_DEV_DATABASE_URL: `postgres://neondb_owner:${devPassword}@ep-dev-pooler.neon.tech/neondb`,
   };
   const first = await runPreviewWorkflow(baseEnv, { fetch: fetchImpl, pg: { Client: FakeClient }, log: (line) => logs.push(line) });
@@ -1334,9 +1341,20 @@ await checkAsync("preview branch workflow creates once, updates env in place, an
   assert.equal(branchDatabase.value, uri);
   assert.equal(branchDatabase.target.length, 1);
   const createdIds = vercelEnv.filter((item) => item.gitBranch === "feature").map((item) => item.id);
+  const deploy = calls.find((call) => call.method === "POST" && call.href.includes("/v13/deployments"));
+  assert.ok(deploy);
+  assert.equal(deploy.href.includes("forceNew=1"), true);
+  const deployBody = JSON.parse(deploy.body);
+  assert.equal(deployBody.name, "odoo-json2");
+  assert.equal(deployBody.project, baseEnv.VERCEL_PROJECT_ID);
+  assert.deepEqual(deployBody.gitSource, { type: "github", org: "tylerjharden", repo: "odoo-json2", ref: "feature" });
+  assert.equal(deployBody.target, undefined);
+  const envPost = calls.findIndex((call) => call.method === "POST" && call.href.includes("/env"));
+  assert.equal(calls.indexOf(deploy) > envPost, true);
   calls.length = 0;
   await runPreviewWorkflow({ ...baseEnv, GITHUB_EVENT_ACTION: "synchronize" }, { fetch: fetchImpl, pg: { Client: FakeClient }, log: (line) => logs.push(line) });
   assert.equal(calls.filter((call) => call.method === "POST" && call.href.endsWith("/branches")).length, 0);
+  assert.equal(calls.some((call) => call.href.includes("/v13/deployments")), false);
   assert.equal(FakeClient.constructed, 0);
   const patched = calls.filter((call) => call.method === "PATCH").map((call) => call.href);
   assert.equal(patched.length, 3);

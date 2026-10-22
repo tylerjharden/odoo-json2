@@ -10,7 +10,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: preview-branch-${{ github.event.pull_request.number || github.event.ref }}
+  group: preview-branch-${{ github.event.pull_request.head.ref || github.event.ref }}
   cancel-in-progress: false
 
 jobs:
