@@ -273,7 +273,7 @@ export function createKvJsonStore(options = {}) {
   };
 }
 
-function connectionSecrets(connectionString) {
+export function connectionSecrets(connectionString) {
   const raw = String(connectionString ?? "");
   const found = [];
   if (raw) found.push(raw);
@@ -301,7 +301,7 @@ function connectionSecrets(connectionString) {
   return [...new Set(found)].sort((a, b) => b.length - a.length);
 }
 
-function redactText(text, secrets) {
+export function redactText(text, secrets) {
   let out = String(text ?? "");
   for (const secret of secrets) {
     if (!secret) continue;
@@ -398,6 +398,15 @@ export function createPostgresJsonStore({ connectionString }) {
   };
 }
 
+// jsonb rejects \u0000 in any string, object keys included.
+function holdsNul(value) {
+  if (typeof value === "string") return value.includes("\u0000");
+  if (value && typeof value === "object") {
+    return Object.entries(value).some(([key, item]) => holdsNul(key) || holdsNul(item));
+  }
+  return false;
+}
+
 export function selectStoreBackend(env = process.env) {
   if (env.BLOB_READ_WRITE_TOKEN) return "blob";
   if (env.KV_REST_API_URL && env.KV_REST_API_TOKEN) return "kv";
@@ -427,6 +436,7 @@ export const STORE_KINDS = Object.freeze({
       url: { env: "DATABASE_URL", secret: true },
     },
     open: (config) => createPostgresJsonStore({ connectionString: config.url }),
+    refuses: (key, value) => (holdsNul(key) || holdsNul(value) ? "postgres cannot store a NUL character" : null),
   },
   file: {
     slots: {

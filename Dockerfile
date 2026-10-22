@@ -1,6 +1,6 @@
 FROM node:20-alpine
 WORKDIR /app
-COPY package.json package-lock.json server.mjs http.mjs ./
+COPY package.json package-lock.json server.mjs http.mjs store-cli.mjs ./
 COPY bin ./bin
 RUN npm ci --omit=dev
 EXPOSE 8788
