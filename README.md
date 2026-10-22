@@ -34,7 +34,7 @@ The `odoo-json2` skill documents `search`, `search_read`, `read`, `create`, `wri
 
 `plugin.json` is only `name` / metadata (no `variables`). Cursor’s plugins reference does **not** document a Notion-only flag or an accounts API. Notion’s Environment rows on that sheet are **Cursor surfaces** (`Local`, `Cloud`, `Cloud — ipp`), each with Connect / Logout.
 
-0.3.2 copies that `mcp.json` shape and ships **three** HTTP resources so Dev / Test / Prod are separate connections (smallest workaround if **+ Add Another Account** still does not appear after Cloud rows are connected). The Vercel pin stores OAuth clients, tokens, and instance credentials in private Blob so Connect survives isolate recycling:
+0.3.2 copies that `mcp.json` shape and ships **three** HTTP resources so Dev / Test / Prod are separate connections (smallest workaround if **+ Add Another Account** still does not appear after Cloud rows are connected). The Vercel pin stores OAuth clients, tokens, and instance credentials in Neon so Connect survives isolate recycling. Blob remains the store when `BLOB_READ_WRITE_TOKEN` is set.
 
 ```json
 {
@@ -56,7 +56,7 @@ export ODOO_JSON2_STORE=/var/lib/odoo-json2/store.json
 node http.mjs   # or: docker build && run, PORT=8788
 ```
 
-On Vercel (`odoo-json2` → `https://odoo-json2.tylerjharden.dev`) the store is private Blob (`BLOB_READ_WRITE_TOKEN`), not `/tmp`. Do not put Odoo API keys in git or Vercel env — they stay in the authorize form and the Blob JSON. Plugin `mcp.json` uses `/mcp/dev`, `/mcp/test`, `/mcp/prod`.
+On Vercel (`odoo-json2` → `https://odoo-json2.tylerjharden.dev`) the store is Neon through `DATABASE_URL`, not `/tmp`. Set `BLOB_READ_WRITE_TOKEN` to use Blob instead. Do not put Odoo API keys in git or Vercel env. They stay in the authorize form and the store document. Plugin `mcp.json` uses `/mcp/dev`, `/mcp/test`, `/mcp/prod`.
 
 ### 2. Install the plugin (0.3.2)
 
