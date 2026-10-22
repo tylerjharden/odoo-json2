@@ -6,7 +6,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, symlinkSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -29,12 +29,15 @@ import {
   startHttp,
   createMemoryStore,
   createBlobJsonStore,
+  createKvJsonStore,
   createRuntimeStore,
   createFileStore,
   parseBlobStoreId,
   selectStoreBackend,
   createPostgresJsonStore,
   emptyStore,
+  OAUTH_MAPS,
+  STORE_KINDS,
   authorizationServerMetadata,
   protectedResourceMetadata,
   parseMcpPath,
@@ -726,6 +729,10 @@ await checkAsync("HTTP OAuth connect Dev then call odoo_version on that account"
       ["odoo_call", "odoo_version"]
     );
     assert.equal(listed.result.tools[0].inputSchema.properties.environment, undefined);
+    assert.deepEqual(
+      Object.keys(store.read()),
+      OAUTH_MAPS.map((map) => map.name)
+    );
   } finally {
     await http.close();
   }
@@ -838,6 +845,16 @@ function mockBlobFetch() {
     return { ok: true, status: 200, text: async () => body };
   };
   return { token, storeId, fetchImpl, files };
+}
+
+function mockKvFetch() {
+  const values = new Map();
+  const fetchImpl = async (_url, init) => {
+    const [command, key, value] = JSON.parse(init.body);
+    if (command === "SET") values.set(key, value);
+    return mockResponse(200, { result: command === "GET" ? values.get(key) ?? null : "OK" });
+  };
+  return { values, fetchImpl };
 }
 
 await checkAsync("durable Blob store survives a second isolate with the same bearer", async () => {
@@ -976,6 +993,92 @@ check("createRuntimeStore follows selectStoreBackend for blob, postgres, and fil
   assert.equal(file.read().clients.y, 1);
 });
 
+check("each store kind's default secret variables select that kind", () => {
+  for (const [name, kind] of Object.entries(STORE_KINDS)) {
+    const env = Object.fromEntries(
+      Object.values(kind.slots)
+        .filter((slot) => slot.secret)
+        .map((slot) => [slot.env, "set"])
+    );
+    assert.equal(selectStoreBackend(env), name);
+  }
+});
+
+await checkAsync("store load tells a missing document from a stored one", async () => {
+  const doc = sampleOAuthDocument();
+  const dir = join(tmpdir(), `odoo-json2-load-${process.pid}`);
+  rmSync(dir, { recursive: true, force: true });
+  const path = join(dir, "store.json");
+  const file = createFileStore(path);
+  assert.deepEqual(file.load(), { found: false });
+  assert.deepEqual(file.read(), emptyStore());
+  file.write(doc);
+  assert.deepEqual(file.load(), { found: true, text: JSON.stringify(doc) });
+  writeFileSync(path, "{not json");
+  assert.deepEqual(file.load(), { found: true, text: "{not json" });
+  assert.deepEqual(file.read(), emptyStore());
+
+  const blob = mockBlobFetch();
+  const blobStore = createBlobJsonStore({ token: blob.token, fetchImpl: blob.fetchImpl });
+  assert.deepEqual(await blobStore.load(), { found: false });
+  assert.deepEqual(await blobStore.read(), emptyStore());
+  await blobStore.write(doc);
+  assert.deepEqual(await blobStore.load(), { found: true, text: JSON.stringify(doc) });
+  assert.deepEqual(await blobStore.read(), doc);
+
+  const kv = mockKvFetch();
+  const kvStore = createKvJsonStore({ url: "https://kv.example", token: "kv-token", fetchImpl: kv.fetchImpl });
+  assert.deepEqual(await kvStore.load(), { found: false });
+  assert.deepEqual(await kvStore.read(), emptyStore());
+  await kvStore.write(doc);
+  assert.deepEqual(await kvStore.load(), { found: true, text: JSON.stringify(doc) });
+  assert.deepEqual(await kvStore.read(), doc);
+
+  assert.deepEqual(createMemoryStore(null).load(), { found: false });
+  assert.deepEqual(createMemoryStore(doc).load(), { found: true, text: JSON.stringify(doc) });
+});
+
+check("file store creates its directory on write and replaces the file with mode 0600", () => {
+  const dir = join(tmpdir(), `odoo-json2-write-${process.pid}`);
+  rmSync(dir, { recursive: true, force: true });
+  const path = join(dir, "nested", "store.json");
+  const store = createFileStore(path);
+  assert.equal(existsSync(dir), false);
+  store.write(emptyStore());
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+  chmodSync(path, 0o644);
+  store.write(sampleOAuthDocument());
+  assert.equal(statSync(path).mode & 0o777, 0o600);
+  assert.deepEqual(readdirSync(join(dir, "nested")), ["store.json"]);
+  assert.deepEqual(store.read(), sampleOAuthDocument());
+});
+
+await checkAsync("blob and kv stores never fall back to ambient credentials", async () => {
+  const names = ["BLOB_READ_WRITE_TOKEN", "KV_REST_API_URL", "KV_REST_API_TOKEN"];
+  const saved = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+  const blob = mockBlobFetch();
+  process.env.BLOB_READ_WRITE_TOKEN = blob.token;
+  process.env.KV_REST_API_URL = "https://ambient-kv.example";
+  process.env.KV_REST_API_TOKEN = "ambient-kv-token";
+  try {
+    await assert.rejects(createBlobJsonStore({ fetchImpl: blob.fetchImpl }).load(), /store id missing/);
+    const sent = [];
+    const kvStore = createKvJsonStore({
+      fetchImpl: async (url, init) => {
+        sent.push([url, init.headers.authorization]);
+        return mockResponse(200, { result: null });
+      },
+    });
+    await kvStore.load();
+    assert.deepEqual(sent, [["", "Bearer "]]);
+  } finally {
+    for (const name of names) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name];
+    }
+  }
+});
+
 function sampleOAuthDocument() {
   return {
     clients: {
@@ -1067,6 +1170,25 @@ if (!postgresTestUrl) {
     } finally {
       await admin.end().catch(() => undefined);
       await Promise.all(stores.map((store) => store.close()));
+    }
+  });
+
+  await checkAsync("postgres load reports a missing row, then the stored document", async () => {
+    const { Client } = await import("pg");
+    const admin = new Client({ connectionString: postgresTestUrl });
+    const store = createPostgresJsonStore({ connectionString: postgresTestUrl });
+    try {
+      await admin.connect();
+      await admin.query("DROP TABLE IF EXISTS public.odoo_json2_oauth_store");
+      assert.deepEqual(await store.load(), { found: false });
+      assert.deepEqual(await store.read(), emptyStore());
+      await store.write(sampleOAuthDocument());
+      const loaded = await store.load();
+      assert.equal(loaded.found, true);
+      assert.deepEqual(JSON.parse(loaded.text), sampleOAuthDocument());
+    } finally {
+      await store.close();
+      await admin.end().catch(() => undefined);
     }
   });
 

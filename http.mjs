@@ -12,7 +12,7 @@
 
 import { createServer } from "node:http";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -58,7 +58,7 @@ function safeEqual(a, b) {
   return timingSafeEqual(left, right);
 }
 
-const BLOB_API = process.env.VERCEL_BLOB_API_URL || "https://vercel.com/api/blob";
+const DEFAULT_BLOB_API = "https://vercel.com/api/blob";
 const BLOB_API_VERSION = "12";
 const DEFAULT_BLOB_PATH = "odoo-json2-oauth-store.json";
 const DEFAULT_KV_KEY = "odoo-json2-oauth-store";
@@ -76,22 +76,49 @@ const OAUTH_STORE_REVOKE = "REVOKE ALL ON TABLE public.odoo_json2_oauth_store FR
 const OAUTH_STORE_UPSERT =
   "INSERT INTO public.odoo_json2_oauth_store (id, doc) VALUES (1, $1::jsonb) ON CONFLICT (id) DO UPDATE SET doc = EXCLUDED.doc";
 
+// removedBy is when the server deletes a record, and copies between stores trust it. A record the
+// server never deletes was never in a store that lacks it. A code may already be exchanged, so it
+// never copies. If the server starts revoking tokens, tokens become "use".
+export const OAUTH_MAPS = Object.freeze([
+  { name: "clients", removedBy: "never", secretKey: false, secretFields: [], printed: ["client_name"] },
+  { name: "codes", removedBy: "use", secretKey: true, secretFields: [], printed: [] },
+  { name: "tokens", removedBy: "expiry", secretKey: true, secretFields: [], printed: ["kind", "accountId"] },
+  { name: "accounts", removedBy: "never", secretKey: false, secretFields: ["apiKey"], printed: ["name"] },
+]);
+
+for (const row of OAUTH_MAPS) {
+  const complete =
+    typeof row.name === "string" &&
+    ["never", "expiry", "use"].includes(row.removedBy) &&
+    typeof row.secretKey === "boolean" &&
+    Array.isArray(row.secretFields) &&
+    Array.isArray(row.printed);
+  if (!complete) throw new Error(`OAUTH_MAPS row ${row.name} is incomplete`);
+}
+
 export function emptyStore() {
-  return { clients: {}, codes: {}, tokens: {}, accounts: {} };
+  return Object.fromEntries(OAUTH_MAPS.map(({ name }) => [name, {}]));
 }
 
 function normalizeStore(parsed) {
-  return {
-    clients: (parsed && parsed.clients) || {},
-    codes: (parsed && parsed.codes) || {},
-    tokens: (parsed && parsed.tokens) || {},
-    accounts: (parsed && parsed.accounts) || {},
-  };
+  return Object.fromEntries(OAUTH_MAPS.map(({ name }) => [name, (parsed && parsed[name]) || {}]));
+}
+
+function readLoaded(loaded) {
+  if (!loaded.found) return emptyStore();
+  try {
+    return normalizeStore(JSON.parse(loaded.text));
+  } catch {
+    return emptyStore();
+  }
 }
 
 export function createMemoryStore(initial = emptyStore()) {
   let data = structuredClone(initial);
   return {
+    load() {
+      return data == null ? { found: false } : { found: true, text: JSON.stringify(data) };
+    },
     read() {
       return data;
     },
@@ -103,17 +130,35 @@ export function createMemoryStore(initial = emptyStore()) {
 
 export function createFileStore(filePath) {
   const path = resolve(filePath);
-  mkdirSync(dirname(path), { recursive: true });
+
+  function load() {
+    try {
+      return { found: true, text: readFileSync(path, "utf8") };
+    } catch (err) {
+      if (err.code === "ENOENT") return { found: false };
+      throw err;
+    }
+  }
+
   return {
+    load,
     read() {
       try {
-        return normalizeStore(JSON.parse(readFileSync(path, "utf8")));
+        return readLoaded(load());
       } catch {
         return emptyStore();
       }
     },
     write(next) {
-      writeFileSync(path, JSON.stringify(next), { mode: 0o600 });
+      mkdirSync(dirname(path), { recursive: true });
+      const temp = `${path}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+      try {
+        writeFileSync(temp, JSON.stringify(next), { mode: 0o600 });
+        renameSync(temp, path);
+      } catch (err) {
+        rmSync(temp, { force: true });
+        throw err;
+      }
     },
   };
 }
@@ -142,30 +187,31 @@ export function parseBlobStoreId(token) {
 }
 
 export function createBlobJsonStore(options = {}) {
-  const token = options.token || process.env.BLOB_READ_WRITE_TOKEN || "";
-  const pathname = options.pathname || process.env.ODOO_JSON2_BLOB_PATH || DEFAULT_BLOB_PATH;
+  const token = options.token || "";
+  const pathname = options.pathname || DEFAULT_BLOB_PATH;
   const fetchImpl = options.fetchImpl || fetch;
   const access = options.access || "private";
-  const apiUrl = (options.apiUrl || BLOB_API).replace(/\/$/, "");
+  const apiUrl = (options.apiUrl || DEFAULT_BLOB_API).replace(/\/$/, "");
   const storeId = options.storeId || parseBlobStoreId(token);
 
+  async function load() {
+    if (!storeId) throw new Error("Vercel Blob store id missing from BLOB_READ_WRITE_TOKEN");
+    const url = new URL(`https://${storeId}.${access}.blob.vercel-storage.com/${pathname}`);
+    url.searchParams.set("cache", "0");
+    const res = await fetchImpl(url.toString(), {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    if (res.status === 404) return { found: false };
+    if (!res.ok) {
+      throw new Error(`blob get ${res.status}: ${await res.text()}`);
+    }
+    return { found: true, text: await res.text() };
+  }
+
   return {
+    load,
     async read() {
-      if (!storeId) throw new Error("Vercel Blob store id missing from BLOB_READ_WRITE_TOKEN");
-      const url = new URL(`https://${storeId}.${access}.blob.vercel-storage.com/${pathname}`);
-      url.searchParams.set("cache", "0");
-      const res = await fetchImpl(url.toString(), {
-        headers: { authorization: `Bearer ${token}` },
-      });
-      if (res.status === 404) return emptyStore();
-      if (!res.ok) {
-        throw new Error(`blob get ${res.status}: ${await res.text()}`);
-      }
-      try {
-        return normalizeStore(JSON.parse(await res.text()));
-      } catch {
-        return emptyStore();
-      }
+      return readLoaded(await load());
     },
     async write(next) {
       const params = new URLSearchParams({ pathname });
@@ -190,9 +236,9 @@ export function createBlobJsonStore(options = {}) {
 }
 
 export function createKvJsonStore(options = {}) {
-  const base = (options.url || process.env.KV_REST_API_URL || "").replace(/\/$/, "");
-  const token = options.token || process.env.KV_REST_API_TOKEN || "";
-  const key = options.key || process.env.ODOO_JSON2_KV_KEY || DEFAULT_KV_KEY;
+  const base = (options.url || "").replace(/\/$/, "");
+  const token = options.token || "";
+  const key = options.key || DEFAULT_KV_KEY;
   const fetchImpl = options.fetchImpl || fetch;
 
   async function command(argv) {
@@ -210,16 +256,16 @@ export function createKvJsonStore(options = {}) {
     return res.json();
   }
 
+  async function load() {
+    const body = await command(["GET", key]);
+    if (body.result == null) return { found: false };
+    return { found: true, text: typeof body.result === "string" ? body.result : JSON.stringify(body.result) };
+  }
+
   return {
+    load,
     async read() {
-      const body = await command(["GET", key]);
-      if (body.result == null) return emptyStore();
-      try {
-        const parsed = typeof body.result === "string" ? JSON.parse(body.result) : body.result;
-        return normalizeStore(parsed);
-      } catch {
-        return emptyStore();
-      }
+      return readLoaded(await load());
     },
     async write(next) {
       await command(["SET", key, JSON.stringify(next)]);
@@ -328,11 +374,16 @@ export function createPostgresJsonStore({ connectionString }) {
     }
   }
 
+  async function load() {
+    const result = await query("SELECT doc::text AS text FROM public.odoo_json2_oauth_store WHERE id = 1");
+    if (result.rowCount === 0) return { found: false };
+    return { found: true, text: result.rows[0].text };
+  }
+
   return {
+    load,
     async read() {
-      const result = await query("SELECT doc FROM public.odoo_json2_oauth_store WHERE id = 1");
-      if (result.rowCount === 0) return emptyStore();
-      return normalizeStore(result.rows[0].doc);
+      return readLoaded(await load());
     },
     async write(next) {
       await query(OAUTH_STORE_UPSERT, [JSON.stringify(next)]);
@@ -354,25 +405,43 @@ export function selectStoreBackend(env = process.env) {
   return "file";
 }
 
+export const STORE_KINDS = Object.freeze({
+  blob: {
+    slots: {
+      token: { env: "BLOB_READ_WRITE_TOKEN", secret: true },
+      path: { env: "ODOO_JSON2_BLOB_PATH", secret: false, fallback: DEFAULT_BLOB_PATH },
+      api: { env: "VERCEL_BLOB_API_URL", secret: false, fallback: DEFAULT_BLOB_API },
+    },
+    open: (config) => createBlobJsonStore({ token: config.token, pathname: config.path, apiUrl: config.api }),
+  },
+  kv: {
+    slots: {
+      url: { env: "KV_REST_API_URL", secret: true },
+      token: { env: "KV_REST_API_TOKEN", secret: true },
+      key: { env: "ODOO_JSON2_KV_KEY", secret: false, fallback: DEFAULT_KV_KEY },
+    },
+    open: (config) => createKvJsonStore({ url: config.url, token: config.token, key: config.key }),
+  },
+  postgres: {
+    slots: {
+      url: { env: "DATABASE_URL", secret: true },
+    },
+    open: (config) => createPostgresJsonStore({ connectionString: config.url }),
+  },
+  file: {
+    slots: {
+      path: { env: "ODOO_JSON2_STORE", secret: false, fallback: "data/store.json" },
+    },
+    open: (config) => createFileStore(config.path),
+  },
+});
+
 export function createRuntimeStore(env = process.env) {
-  const backend = selectStoreBackend(env);
-  if (backend === "blob") {
-    return createBlobJsonStore({
-      token: env.BLOB_READ_WRITE_TOKEN,
-      pathname: env.ODOO_JSON2_BLOB_PATH || DEFAULT_BLOB_PATH,
-    });
-  }
-  if (backend === "kv") {
-    return createKvJsonStore({
-      url: env.KV_REST_API_URL,
-      token: env.KV_REST_API_TOKEN,
-      key: env.ODOO_JSON2_KV_KEY || DEFAULT_KV_KEY,
-    });
-  }
-  if (backend === "postgres") {
-    return createPostgresJsonStore({ connectionString: env.DATABASE_URL });
-  }
-  return createFileStore(env.ODOO_JSON2_STORE || resolve("data/store.json"));
+  const kind = STORE_KINDS[selectStoreBackend(env)];
+  const config = Object.fromEntries(
+    Object.entries(kind.slots).map(([name, slot]) => [name, env[slot.env] || slot.fallback])
+  );
+  return kind.open(config);
 }
 
 async function readStore(store) {
