@@ -182,6 +182,34 @@ Set `DATABASE_URL` to a Postgres connection string. This server opens that strin
 
 The image runs `npm ci --omit=dev` and installs `pg`. An unset `DATABASE_URL` still selects the JSON file.
 
+### Preview deployments
+
+A preview deployment opens its own Neon branch. When `VERCEL_ENV` is `preview`, the process exits before it opens a database unless every check below passes.
+
+- The selected store is Postgres. Blob, KV, and the JSON file are refused. Unset `BLOB_READ_WRITE_TOKEN` and the KV REST variables for Preview.
+- `NEON_BRANCH_ID` is a Neon branch id other than production `br-orange-surf-b79ym7h7` and other than the shared dev branch `br-rough-moon-b79ppj13`.
+- The host in `DATABASE_URL` matches `NEON_ENDPOINT_HOST`. A pooled host and a direct host for the same endpoint match.
+- `NEON_PREVIEW_DENY_HOSTS` is set and does not list that host.
+- `VERCEL_GIT_PULL_REQUEST_ID` is set. Vercel sets it on preview deployments.
+
+Clients, accounts, authorization codes, and tokens created on a preview get `previewPr` set to that pull request id.
+
+`.github/workflows/preview-branch.yml` creates the Neon branch `preview-pr-N` from the shared dev branch when a pull request opens, updates, or reopens. The workflow sets `DATABASE_URL`, `NEON_BRANCH_ID`, and `NEON_ENDPOINT_HOST` for that git branch's preview environment. It does not run SQL on the new branch. When the pull request closes, or the head branch is deleted, the workflow deletes that Neon branch, deletes those three preview variables, and removes records on the shared dev branch whose `previewPr` is that pull request.
+
+A preview exits at startup until the branch variables and the deny list exist. Production and local development keep the store precedence above. To point production back at Blob, set `BLOB_READ_WRITE_TOKEN` and redeploy. A preview still refuses to boot while that token is set.
+
+GitHub Actions secrets the workflow reads, and does not print:
+
+- `NEON_API_KEY`
+- `NEON_PROJECT_ID`
+- `NEON_DEV_DATABASE_URL`, used only to sweep the shared dev branch
+- `VERCEL_TOKEN`
+- `NEON_PARENT_BRANCH_ID`, optional. When it is unset, the parent branch is `br-rough-moon-b79ppj13`.
+
+Set `NEON_PREVIEW_DENY_HOSTS` on the Vercel project for Preview. Use the production endpoint host and the shared dev endpoint host, separated by a comma. No scheme and no password. Copy the hosts from the Neon console.
+
+The sweep replaces the one shared-dev document. A login that the server writes in that moment can be lost. Run the workflow again to remove a `previewPr` that remains. The new preview branch is the database a preview is allowed to open. The sweep only cleans records that landed on the shared dev branch.
+
 ## Layout
 
 ```
