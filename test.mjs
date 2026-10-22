@@ -655,7 +655,8 @@ await checkAsync("HTTP OAuth connect Dev then call odoo_version on that account"
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
     });
     assert.equal(unauth.status, 401);
-    assert.match(unauth.headers.get("www-authenticate") || "", /resource_metadata=/);
+    assert.match(unauth.headers.get("www-authenticate") || "", /resource_metadata="[^"]+\/\.well-known\/oauth-protected-resource\/mcp"/);
+    assert.equal(unauth.headers.get("access-control-expose-headers"), "WWW-Authenticate, Mcp-Session-Id");
 
     const registered = await (
       await realFetch(`${base}/oauth/register`, {
@@ -726,6 +727,128 @@ await checkAsync("HTTP OAuth connect Dev then call odoo_version on that account"
       ["odoo_call", "odoo_version"]
     );
     assert.equal(listed.result.tools[0].inputSchema.properties.environment, undefined);
+  } finally {
+    await http.close();
+  }
+});
+
+await checkAsync("Notion dynamic registration and PKCE S256", async () => {
+  const notionRedirect = "https://app.notion.com/workflows/mcp/oauth/callback";
+  const store = createMemoryStore();
+  const http = await startHttp({ store, port: 0 });
+  const base = `http://127.0.0.1:${http.port}`;
+  try {
+    const rejected = await realFetch(`${base}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        client_name: "Notion",
+        redirect_uris: ["https://evil.example/callback"],
+        token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+      }),
+    });
+    assert.equal(rejected.status, 400);
+    assert.equal((await rejected.json()).error, "invalid_redirect_uri");
+    assert.deepEqual(Object.keys((await store.read()).clients), []);
+
+    const registeredResponse = await realFetch(`${base}/oauth/register`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({
+        client_name: "Notion",
+        redirect_uris: [notionRedirect],
+        token_endpoint_auth_method: "none",
+        grant_types: ["authorization_code", "refresh_token"],
+        response_types: ["code"],
+        scope: "mcp",
+      }),
+    });
+    assert.equal(registeredResponse.status, 201);
+    const registered = await registeredResponse.json();
+    assert.equal(registered.client_name, "Notion");
+    assert.equal(registered.token_endpoint_auth_method, "none");
+    assert.equal(registered.client_secret, undefined);
+    assert.deepEqual(registered.redirect_uris, [notionRedirect]);
+
+    const { verifier, challenge } = pkce();
+    const authorizeUrl = `${base}/oauth/authorize?response_type=code&client_id=${registered.client_id}&redirect_uri=${encodeURIComponent(notionRedirect)}&code_challenge=${challenge}&code_challenge_method=S256&state=notion-state&scope=mcp&resource=${encodeURIComponent(`${base}/mcp`)}`;
+    const posted = await realFetch(authorizeUrl, {
+      method: "POST",
+      body: new URLSearchParams({
+        account: "dev",
+        url: "https://dev.example.com",
+        database: "dev-db",
+        api_key: "dev-key",
+      }),
+      redirect: "manual",
+    });
+    assert.equal(posted.status, 302);
+    const location = new URL(posted.headers.get("location"));
+    assert.equal(location.origin + location.pathname, notionRedirect);
+    assert.equal(location.searchParams.get("state"), "notion-state");
+    assert.equal(location.searchParams.get("iss"), base);
+    const code = location.searchParams.get("code");
+
+    const tokenResponse = await realFetch(`${base}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        client_id: registered.client_id,
+        redirect_uri: notionRedirect,
+        code_verifier: verifier,
+      }),
+    });
+    assert.equal(tokenResponse.status, 200);
+    const tokenBody = await tokenResponse.json();
+    assert.equal(tokenBody.token_type, "bearer");
+    assert.equal(tokenBody.scope, "mcp");
+    assert.ok(tokenBody.access_token);
+    assert.ok(tokenBody.refresh_token);
+
+    const plain = await realFetch(`${base}/oauth/authorize?response_type=code&client_id=${registered.client_id}&redirect_uri=${encodeURIComponent(notionRedirect)}&code_challenge=${challenge}&code_challenge_method=plain`, {
+      method: "POST",
+      body: new URLSearchParams({ account: "dev", url: "https://dev.example.com", database: "dev-db", api_key: "dev-key" }),
+      redirect: "manual",
+    });
+    assert.equal(plain.status, 400);
+    assert.match(await plain.text(), /PKCE S256 is required/);
+
+    const initialized = await realFetch(`${base}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: `Bearer ${tokenBody.access_token}`,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "Notion", version: "1.0" } },
+      }),
+    });
+    assert.equal(initialized.status, 200);
+    const initBody = await initialized.json();
+    assert.equal(initBody.result.serverInfo.name, "odoo-json2");
+
+    const refreshed = await (
+      await realFetch(`${base}/oauth/token`, {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: tokenBody.refresh_token,
+          client_id: registered.client_id,
+        }),
+      })
+    ).json();
+    assert.ok(refreshed.access_token);
+    assert.equal(refreshed.refresh_token, tokenBody.refresh_token);
+    assert.equal(refreshed.scope, "mcp");
   } finally {
     await http.close();
   }

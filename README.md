@@ -58,6 +58,8 @@ node http.mjs   # or: docker build && run, PORT=8788
 
 On Vercel (`odoo-json2` → `https://odoo-json2.tylerjharden.dev`) the store is private Blob (`BLOB_READ_WRITE_TOKEN`), not `/tmp`. Do not put Odoo API keys in git or Vercel env — they stay in the authorize form and the Blob JSON. Plugin `mcp.json` uses `/mcp/dev`, `/mcp/test`, `/mcp/prod`.
 
+Notion Custom Agents use the same host over OAuth. Paste `https://odoo-json2.tylerjharden.dev/mcp`, choose OAuth, and complete the account form. A workspace admin turns on custom MCP servers under Settings → Connections first. The server accepts Notion's callbacks `https://app.notion.com/workflows/mcp/oauth/callback` and `https://www.notion.so/workflows/mcp/oauth/callback`.
+
 ### 2. Install the plugin (0.3.2)
 
 Copy or clone **into** `~/.cursor/plugins/local/odoo-json2` from this branch (no outbound symlink), or republish / refresh the marketplace listing. Reload Window.
