@@ -32,6 +32,9 @@ import {
   createRuntimeStore,
   createFileStore,
   parseBlobStoreId,
+  selectStoreBackend,
+  createPostgresJsonStore,
+  emptyStore,
   authorizationServerMetadata,
   protectedResourceMetadata,
   parseMcpPath,
@@ -917,6 +920,179 @@ check("createRuntimeStore prefers Blob over a local file path", () => {
   file.write({ clients: { x: 1 }, codes: {}, tokens: {}, accounts: {} });
   assert.equal(file.read().clients.x, 1);
 });
+
+check("selectStoreBackend precedence is blob, kv, postgres, then file", () => {
+  const databaseUrl = "postgres://db.example/odoo";
+  const kv = { KV_REST_API_URL: "https://kv.example", KV_REST_API_TOKEN: "token" };
+  assert.equal(
+    selectStoreBackend({
+      BLOB_READ_WRITE_TOKEN: "vercel_blob_rw_store_secret",
+      ...kv,
+      DATABASE_URL: databaseUrl,
+      ODOO_JSON2_STORE: "/tmp/store.json",
+    }),
+    "blob"
+  );
+  assert.equal(selectStoreBackend({ BLOB_READ_WRITE_TOKEN: " " }), "blob");
+  assert.equal(selectStoreBackend({ ...kv, DATABASE_URL: databaseUrl }), "kv");
+  assert.equal(selectStoreBackend({ KV_REST_API_URL: kv.KV_REST_API_URL, DATABASE_URL: databaseUrl }), "postgres");
+  assert.equal(selectStoreBackend({ KV_REST_API_TOKEN: kv.KV_REST_API_TOKEN, DATABASE_URL: databaseUrl }), "postgres");
+  assert.equal(selectStoreBackend({ DATABASE_URL: databaseUrl }), "postgres");
+  assert.equal(selectStoreBackend({ DATABASE_URL: " " }), "postgres");
+  assert.equal(selectStoreBackend({ DATABASE_URL: "" }), "file");
+  assert.equal(
+    selectStoreBackend({
+      BLOB_READ_WRITE_TOKEN: "",
+      KV_REST_API_URL: "",
+      KV_REST_API_TOKEN: "",
+      DATABASE_URL: "",
+    }),
+    "file"
+  );
+  assert.equal(selectStoreBackend({}), "file");
+});
+
+check("createRuntimeStore follows selectStoreBackend for blob, postgres, and file", () => {
+  const blob = mockBlobFetch();
+  const blobStore = createRuntimeStore({
+    BLOB_READ_WRITE_TOKEN: blob.token,
+    KV_REST_API_URL: "https://kv.example",
+    KV_REST_API_TOKEN: "token",
+    DATABASE_URL: "postgres://odoo:pw@127.0.0.1:1/db",
+  });
+  assert.equal(blobStore.close, undefined);
+  const postgresStore = createRuntimeStore({
+    KV_REST_API_URL: "https://kv.example",
+    DATABASE_URL: "postgres://odoo:pw@127.0.0.1:1/db",
+  });
+  assert.equal(typeof postgresStore.close, "function");
+  const file = createRuntimeStore({
+    DATABASE_URL: "",
+    KV_REST_API_TOKEN: "only-half",
+    ODOO_JSON2_STORE: "/tmp/odoo-json2-empty-database-url.json",
+  });
+  assert.equal(file.close, undefined);
+  file.write({ clients: { y: 1 }, codes: {}, tokens: {}, accounts: {} });
+  assert.equal(file.read().clients.y, 1);
+});
+
+function sampleOAuthDocument() {
+  return {
+    clients: {
+      "client-1": {
+        client_id: "client-1",
+        redirect_uris: ["http://localhost:8787/callback"],
+        token_endpoint_auth_method: "none",
+        client_name: "cursor",
+      },
+    },
+    codes: {},
+    tokens: {
+      "raw-token-key": { kind: "access", accountId: "dev", exp: 1 },
+    },
+    accounts: {
+      dev: {
+        id: "dev",
+        name: "dev",
+        label: "Dev",
+        url: "https://dev.example.com",
+        apiKey: "secret-key",
+        database: "dev-db",
+        urlVar: "connected account",
+        keyVar: "connected account API key",
+        dbVar: "connected account database",
+        production: false,
+      },
+    },
+  };
+}
+
+await checkAsync("refused postgres connection hides the password", async () => {
+  await import("pg");
+  const password = "pw-do-not-leak-9f3a";
+  const connectionString = `postgres://odoo:${password}@127.0.0.1:1/odoo_json2`;
+  const store = createPostgresJsonStore({ connectionString });
+  let thrown = null;
+  try {
+    await store.read();
+  } catch (err) {
+    thrown = err;
+  } finally {
+    await store.close();
+  }
+  assert.ok(thrown, "expected the refused connection to throw");
+  const text = `${thrown.message}\n${thrown.stack}`;
+  assert.equal(text.includes(password), false);
+  assert.equal(text.includes(connectionString), false);
+});
+
+const postgresTestUrl = process.env.ODOO_JSON2_TEST_DATABASE_URL || "";
+if (!postgresTestUrl) {
+  if (process.env.ODOO_JSON2_REQUIRE_POSTGRES) {
+    fail("postgres integration", new Error("ODOO_JSON2_TEST_DATABASE_URL is required when ODOO_JSON2_REQUIRE_POSTGRES is set"));
+  }
+} else {
+  await checkAsync("postgres store round-trips account fields and a raw token key", async () => {
+    const doc = sampleOAuthDocument();
+    const writer = createPostgresJsonStore({ connectionString: postgresTestUrl });
+    const reader = createPostgresJsonStore({ connectionString: postgresTestUrl });
+    try {
+      await writer.write(doc);
+      const got = await reader.read();
+      assert.equal(got.accounts.dev.apiKey, "secret-key");
+      assert.deepEqual(got.accounts.dev, doc.accounts.dev);
+      assert.deepEqual(got.tokens["raw-token-key"], doc.tokens["raw-token-key"]);
+      assert.deepEqual(got, doc);
+    } finally {
+      await writer.close();
+      await reader.close();
+    }
+  });
+
+  await checkAsync("postgres setup does not wipe a stored document", async () => {
+    const { Client } = await import("pg");
+    const admin = new Client({ connectionString: postgresTestUrl });
+    const stores = [];
+    try {
+      await admin.connect();
+      await admin.query("DROP TABLE IF EXISTS public.odoo_json2_oauth_store");
+      for (let i = 0; i < 5; i += 1) stores.push(createPostgresJsonStore({ connectionString: postgresTestUrl }));
+      const docs = await Promise.all(stores.map((store) => store.read()));
+      for (const doc of docs) assert.deepEqual(doc, emptyStore());
+      const next = sampleOAuthDocument();
+      await stores[0].write(next);
+      const later = createPostgresJsonStore({ connectionString: postgresTestUrl });
+      stores.push(later);
+      assert.deepEqual(await later.read(), next);
+    } finally {
+      await admin.end().catch(() => undefined);
+      await Promise.all(stores.map((store) => store.close()));
+    }
+  });
+
+  await checkAsync("postgres read throws when the table is missing", async () => {
+    const { Client } = await import("pg");
+    const admin = new Client({ connectionString: postgresTestUrl });
+    const store = createPostgresJsonStore({ connectionString: postgresTestUrl });
+    let sqlError = null;
+    try {
+      await admin.connect();
+      await store.write(sampleOAuthDocument());
+      await admin.query("DROP TABLE public.odoo_json2_oauth_store");
+      try {
+        await store.read();
+      } catch (err) {
+        sqlError = err;
+      }
+      assert.ok(sqlError, "expected a SQL error after the table was dropped");
+      assert.match(sqlError.message, /odoo_json2_oauth_store/);
+      assert.equal(String(sqlError.message).includes("secret-key"), false);
+    } finally {
+      await store.close();
+      await admin.end().catch(() => undefined);
+    }
+  });
+}
 
 process.stderr.write(`\n${passed} passed, ${failed} failed\n`);
 if (failed) process.exit(1);

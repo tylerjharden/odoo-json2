@@ -18,8 +18,12 @@
   },
   "scripts": {
     "check": "node --check server.mjs",
+    "prepare": "npm ls pg --depth=0",
     "test": "node test.mjs",
     "start": "node server.mjs",
     "start:http": "node http.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
   }
 }

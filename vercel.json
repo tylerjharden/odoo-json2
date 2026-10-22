@@ -2,6 +2,6 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": null,
   "buildCommand": "",
-  "installCommand": "echo skip",
+  "installCommand": "npm ci --omit=dev && npm ls pg --depth=0",
   "rewrites": [{ "source": "/(.*)", "destination": "/api" }]
 }
